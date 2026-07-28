@@ -11,3 +11,5 @@ platformio.local.ini
 # CI staging dir for release binaries (.github/workflows/build.yml)
 dist/
 PROJECT_NOTES.md
+# LoRaWAN OTAA credentials (WP2) -- copy include/lorawan_secrets.h.example -> lorawan_secrets.h
+include/lorawan_secrets.h

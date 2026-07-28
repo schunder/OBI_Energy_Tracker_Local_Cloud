@@ -24,20 +24,13 @@
 #include "board_config.h"
 #include "obi_proto.h"
 #include "obi_ecdh.h"
+#include "obi_radio_params.h"   // reversed OBI radio PHY constants (shared with obi_to_lorawan.cpp)
 #include "reader.h"
 #include "gateway_web.h"
 #include "flash_dbg.h"
 #include "status_led.h"
+#include "obi_to_lorawan.h"
 #include <Preferences.h>
-
-// ---- reversed OBI radio configuration --------------------------------------
-#define OBI_FREQ_MHZ   869.5f
-#define OBI_BW_KHZ     500.0f
-#define OBI_SF         7
-#define OBI_CR         5
-#define OBI_SYNCWORD   0x12          // RadioLib private -> SX126x 0x1424
-#define OBI_TXPWR_DBM  22
-#define OBI_PREAMBLE   12
 
 // ---- our gateway identity (any 6 bytes; the reader stores it on bind) -------
 const uint8_t GWID[6] = { 'O', 'B', 'I', 'E', 'S', 'P' };
@@ -1001,7 +994,14 @@ static void loraTask(void *) {
     if (g_rx) { g_rx = false; handleRx(); }
     uint32_t now = millis();
     bool ota = gw_ota_active();
-    if (now - lastBeacon >= 1000u) { lastBeacon = now; sendBeacon(); }   // keep 1 Hz beacon (readers pace to it)
+    if (now - lastBeacon >= 1000u) {
+      lastBeacon = now;
+      sendBeacon();   // keep 1 Hz beacon (readers pace to it)
+      // SHARED radio mode: the moment right after a beacon TX is the safest place to steal
+      // the radio for a LoRaWAN transaction — every reader just resynced and won't expect
+      // another beacon for ~1 s, and we're not mid-OTA. See obi_to_lorawan.cpp / WP3.
+      if (!ota) obi_lorawan_tick(readers, MAX_READERS, now);
+    }
     if (!ota && now - lastScan >= 3000) { lastScan = now; sendScan(); }
     if (!ota)                                         // re-pair safety net for assigned, not-yet-keyed readers
       for (auto &r : readers)
@@ -1025,7 +1025,13 @@ void setup() {
   int st = radio.begin(OBI_FREQ_MHZ, OBI_BW_KHZ, OBI_SF, OBI_CR,
                        OBI_SYNCWORD, OBI_TXPWR_DBM, OBI_PREAMBLE, LORA_TCXO_V, false);
   if (st != RADIOLIB_ERR_NONE) { Serial.printf("radio.begin FAILED %d — halt\n", st); while (1) delay(1000); }
-#if LORA_DIO2_RFSW
+  // Antenna-switch control: boards with a dedicated RXEN GPIO (e.g. the Wio-SX1262 B2B
+  // module, switch on GPIO38) must use setRfSwitchPins(), NOT setDio2AsRfSwitch() — DIO2
+  // isn't wired to the switch there, so that call would silently leave RX deaf. Prefer
+  // LORA_RXEN_PIN whenever the board defines one; fall back to DIO2 only if it doesn't.
+#if defined(LORA_RXEN_PIN) && (LORA_RXEN_PIN != RADIOLIB_NC)
+  radio.setRfSwitchPins(LORA_RXEN_PIN, RADIOLIB_NC);
+#elif LORA_DIO2_RFSW
   radio.setDio2AsRfSwitch(true);
 #endif
   radio.setCRC(2);
@@ -1049,6 +1055,11 @@ void setup() {
   radio.startReceive();
   Serial.println("listening + beaconing...");
 
+  // LoRaWAN uplink path (WP2/WP3, SHARED radio mode) — the radio chip is already
+  // begin()'d above with OBI's PHY params; this only prepares the LoRaWAN OTAA stack
+  // and restores a persisted session, it does NOT touch the radio's current config.
+  obi_lorawan_setup();
+
 #ifdef PIN_BUTTON
   buttonSetup();   // case button: hold to factory-reset (closed-case OBI_BOARD_OBI_C3)
 #endif
@@ -1056,7 +1067,10 @@ void setup() {
   // LoRa in its own task, priority ABOVE the TCP/IP stack (18) + web task (1) so on the single-core C3 the
   // WiFi/HTTP/MQTT work can't delay a reader's OTA block response past its short RX window (this is the
   // real reason the C3 was slow vs the dual-core S3). Below the WiFi driver (23) so WiFi stays healthy.
-  xTaskCreatePinnedToCore(loraTask, "lora", 8192, nullptr, 20, nullptr, CONFIG_ARDUINO_RUNNING_CORE);
+  // Stack raised 8192 -> 16384: the SHARED-mode LoRaWAN transaction (LoRaWANNode join/sendReceive +
+  // AES + session buffers) runs on THIS task and adds significant call-depth on top of what the
+  // OBI-only path needed — 8 KB risks a stack overflow (a suspected cause of the C3 boot crash).
+  xTaskCreatePinnedToCore(loraTask, "lora", 16384, nullptr, 20, nullptr, CONFIG_ARDUINO_RUNNING_CORE);
   web_setup();     // WiFi config portal + web dashboard + MQTT (non-fatal if WiFi is unavailable)
 }
 
