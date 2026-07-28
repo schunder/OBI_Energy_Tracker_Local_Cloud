@@ -66,8 +66,14 @@
   #define STATUS_LED_ACTIVE_LOW 1
 
 #elif defined(OBI_BOARD_XIAO_ESP32S3)       // Seeed Studio XIAO ESP32S3 & Wio-SX1262 Kit (B2B)
-  // Pin mapping via the on-board B2B connector. Wio-SX1262 has a TCXO on DIO3,
-  // DIO2 drives the internal RF switch, and RF_SW (GPIO38) is the RX enable.
+  // Pin mapping via the on-board B2B connector. Wio-SX1262 has a TCXO on DIO3.
+  // FIX (fleet-verified, see LoRaWANsensors/SeeedXIAOLoRaWAN — proven on RadioLib 7.0.2):
+  // the antenna switch on THIS module is wired to GPIO38 (RF_SW / RXEN), NOT to the
+  // SX1262's DIO2. Upstream's original preset here set LORA_DIO2_RFSW=true, which drives
+  // a pin the switch isn't connected to — the switch is left floating/undriven and RX
+  // never actually opens ("deaf RX": TX may work by luck, but nothing is ever received,
+  // e.g. no reader announce, no LoRaWAN JoinAccept). main.cpp now prefers LORA_RXEN_PIN
+  // (setRfSwitchPins) over LORA_DIO2_RFSW whenever it is defined and != RADIOLIB_NC.
   #define PIN_LORA_NSS   41
   #define PIN_LORA_SCK   7
   #define PIN_LORA_MOSI  9
@@ -76,8 +82,8 @@
   #define PIN_LORA_BUSY  40
   #define PIN_LORA_DIO1  39
   #define LORA_TCXO_V    1.8f     // Wio-SX1262 TCXO on DIO3
-  #define LORA_RXEN_PIN  38       // RF_SW on module — HIGH during RX
-  #define LORA_DIO2_RFSW true
+  #define LORA_RXEN_PIN  38       // RF_SW on module — driven by RadioLib per TX/RX window
+  #define LORA_DIO2_RFSW false    // switch is NOT on DIO2 on this module — see fix note above
 
 #elif defined(OBI_BOARD_CUSTOM)            // <-- your own wiring: edit these
   #define PIN_LORA_NSS   8

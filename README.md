@@ -1,5 +1,15 @@
 # OBI Energy Bridge — Reverse Engineering & Self-Hosting
 
+> ### ⚡ Fork note — adds a LoRaWAN uplink
+> This is a **fork** of the original by **[Aaron Christophel (atc1441)](https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud)** —
+> all of the reverse-engineering and the entire base gateway firmware below are **his work**. This fork
+> adds **one thing**: a standard **LoRaWAN OTAA (EU868) uplink**, so the OBI readers can report to any
+> LoRaWAN network server (ChirpStack/TTN) in addition to everything the base firmware already does.
+> **→ What it adds, how it's built, and the hardware notes: [`open_obi_energy_meter/LORAWAN.md`](open_obi_energy_meter/LORAWAN.md).**
+> Everything else in this README is atc1441's original documentation, unchanged.
+
+---
+
 Full teardown of the **OBI energy-tracking system**: a WiFi/BLE **bridge** (ESP32-C3) that relays data
 from LoRa **meter readers** (BAT32G135) to an AWS-IoT cloud. This repo documents the protocols end-to-end
 and shows how to **run the device against your own cloud** or **talk to the reader directly over

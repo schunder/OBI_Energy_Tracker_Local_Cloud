@@ -4,12 +4,20 @@
 #include "gateway_web.h"
 #include "reader.h"
 #include "flash_dbg.h"
+#include "obi_to_lorawan.h"   // runtime LoRaWAN-uplink enable toggle (/api/lw)
 #include <WiFi.h>
 #include <WiFiManager.h>          // tzapu/WiFiManager
 #include <WebServer.h>
 #include <Update.h>               // ESP32 self-OTA (reflash our own app into the other OTA slot)
 #include <HTTPClient.h>           // pull the latest release .bin from GitHub (settings -> firmware)
+// OBI_NO_TLS (set for obi_gateway_c3 — see platformio.ini): this "pioarduino" framework build ships
+// mbedtls crypto but NOT the standalone mbedtls_ssl_* TLS handshake layer, so anything using
+// WiFiClientSecure fails to link. The LoRaWAN-bridge fork doesn't need TLS at all — the only users
+// are two optional convenience features (MQTTS to a broker, default-off; and the GitHub self-updater
+// over HTTPS). Both are compiled out under OBI_NO_TLS; plain MQTT (port 1883) still works.
+#ifndef OBI_NO_TLS
 #include <WiFiClientSecure.h>     // HTTPS to api.github.com / release asset host
+#endif
 #include <esp_partition.h>        // partition list for the /debug hex editor
 #include <esp_ota_ops.h>           // running/inactive OTA partition -- /debug flash map
 #include <esp_image_format.h>      // esp_image_get_metadata() -- real firmware byte size for the flash map
@@ -51,7 +59,9 @@ static bool g_epdOk = false;
 
 static WebServer      server(80);
 static WiFiClient       net;         // plain MQTT (port 1883)
+#ifndef OBI_NO_TLS
 static WiFiClientSecure netTls;      // MQTTS (TLS) — used when g_mqttTls; ESP32 does the TLS, no HTTPS on the web side
+#endif
 static PubSubClient  mqtt(net);
 static Preferences   prefs;
 static WiFiManager   wm;
@@ -144,16 +154,21 @@ static void dailySpace(size_t &total, size_t &used);      // fwd: daily-summary 
 // unresponsive, and it repeats on every retry until the config is fixed. 5 s is generous for a real broker
 // on the LAN/internet and turns a 2-minute freeze into a brief, tolerable one.
 static void applyMqttClient() {
+#ifndef OBI_NO_TLS
   netTls.setTimeout(5);            // TCP connect budget for the TLS socket
   netTls.setHandshakeTimeout(5);   // TLS handshake budget (library default: 120 s)
+#endif
   net.setTimeout(5);               // TCP connect budget for the plain socket
   mqtt.setSocketTimeout(5);        // PubSubClient's own read timeout while waiting for CONNACK etc. (default: 15 s)
+#ifndef OBI_NO_TLS
   if (g_mqttTls) {
     if (g_mqttCa.length()) netTls.setCACert(g_mqttCa.c_str());
     else                   netTls.setInsecure();     // encrypt only, don't validate the cert chain
     mqtt.setClient(netTls);
-  } else {
-    mqtt.setClient(net);
+  } else
+#endif
+  {
+    mqtt.setClient(net);           // OBI_NO_TLS: always plain MQTT (TLS compiled out)
   }
   mqtt.setServer(g_mqttHost, g_mqttPort);
 }
@@ -1237,6 +1252,10 @@ static String findAssetUrl(const String &body, const char *target) {
 // codeOut (optional) receives the HTTP status (or negative HTTPClient error / 0 if we couldn't even connect).
 static bool githubLatest(String &tag, String &url, int *codeOut = nullptr) {
   if (codeOut) *codeOut = 0;
+#ifdef OBI_NO_TLS
+  (void)tag; (void)url;
+  return false;   // GitHub check needs HTTPS (WiFiClientSecure) — compiled out in the no-TLS build
+#else
   if (WiFi.status() != WL_CONNECTED) return false;
   WiFiClientSecure cli; cli.setInsecure();
   HTTPClient http; http.setUserAgent("OBI-Gateway");
@@ -1272,6 +1291,7 @@ static bool githubLatest(String &tag, String &url, int *codeOut = nullptr) {
   tag = jsonField(body, "tag_name");
   url = findAssetUrl(body, FW_BUILD_TARGET);
   return tag.length() > 0;
+#endif   // OBI_NO_TLS
 }
 static void handleGithubLatest() {
   String tag, url; int code = 0;
@@ -1300,6 +1320,7 @@ static void ghOtaTask(void *) {
   otaHist_prepareForFlash();
   bool ok = false;
   String tag, url;
+#ifndef OBI_NO_TLS
   if (githubLatest(tag, url) && url.length()) {
     WiFiClientSecure cli; cli.setInsecure();
     HTTPClient http; http.setUserAgent("OBI-Gateway");
@@ -1340,6 +1361,9 @@ static void ghOtaTask(void *) {
     }
     http.end();
   }
+#else
+  Serial.println("[ghota] GitHub self-update unavailable in the no-TLS build");
+#endif   // OBI_NO_TLS
   g_ghState = ok ? 2 : 3;
   if (ok) { delay(900); ESP.restart(); }
   else otaHist_abortFlash();   // failed/rejected -- stay on current firmware, recover history right away
@@ -1832,6 +1856,19 @@ static void handlePairAll() {
   if (s == 0 || s > 3600) s = 180;
   gw_pair_all(s);
   server.send(200, "application/json", String("{\"ok\":true,\"seconds\":") + s + "}");
+}
+// LoRaWAN uplink runtime toggle. GET returns state; POST ?en=1 / ?en=0 enables/disables (persisted).
+// Default OFF — the SHARED-mode radio transaction is risky on the single-core C3, so it stays dormant
+// until deliberately turned on here (see obi_to_lorawan.cpp). Only flips a flag; the loraTask does the
+// actual radio init on its next tick.
+static void handleLwToggle() {
+  if (server.hasArg("en")) {
+    String v = server.arg("en");
+    obi_lorawan_set_enabled(v == "1" || v == "true" || v == "on");
+  }
+  String j = String("{\"enabled\":") + (obi_lorawan_enabled() ? "true" : "false") +
+             ",\"joined\":" + (obi_lorawan_joined() ? "true" : "false") + "}";
+  server.send(200, "application/json", j);
 }
 static void sendRadioChunk(const String &chunk) { server.sendContent(chunk); }
 static void handleRadioApi() {
@@ -3110,6 +3147,7 @@ static void startServices() {
   server.on("/api/name",        HTTP_POST, guard(handleName));    // set/clear a reader's friendly name
   server.on("/api/boxcfg",      HTTP_POST, guard(handleBoxCfg));  // set/clear a reader's dashboard box layout
   server.on("/api/pairall",     HTTP_POST, guard(handlePairAll));  // open the 3-min auto-accept window
+  server.on("/api/lw",                     guard(handleLwToggle)); // GET state / POST ?en=1 to enable the LoRaWAN uplink
   server.on("/radio",           HTTP_GET,  guard(handleRadioPage));  // live radio message view
   server.on("/api/radio",       HTTP_GET,  guard(handleRadioApi));
   server.on("/history",         HTTP_GET,  guard(handleHistoryPage)); // per-reader energy history + charts
