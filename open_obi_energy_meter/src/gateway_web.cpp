@@ -5,6 +5,7 @@
 #include "reader.h"
 #include "flash_dbg.h"
 #include "obi_to_lorawan.h"   // runtime LoRaWAN-uplink enable toggle (/api/lw)
+#include "obi_deveui.h"       // fleet DevEUI derivation (exposed on /api/lw for NS registration)
 #include <WiFi.h>
 #include <WiFiManager.h>          // tzapu/WiFiManager
 #include <WebServer.h>
@@ -1503,7 +1504,11 @@ static void handleLwToggle() {
     obi_lorawan_set_enabled(v == "1" || v == "true" || v == "on");
   }
   String j = String("{\"enabled\":") + (obi_lorawan_enabled() ? "true" : "false") +
-             ",\"joined\":" + (obi_lorawan_joined() ? "true" : "false") + "}";
+             ",\"joined\":" + (obi_lorawan_joined() ? "true" : "false") +
+             ",\"last\":\"" + obi_lorawan_last_state() + "\"" +
+             ",\"attempts\":" + String(obi_lorawan_attempts()) +
+             ",\"deveui\":\"" + obi_deveui_to_string(obi_build_deveui()) + "\"" +
+             ",\"appeui\":\"0000000000000000\"}";
   server.send(200, "application/json", j);
 }
 static void sendRadioChunk(const String &chunk) { server.sendContent(chunk); }
