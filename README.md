@@ -1,11 +1,15 @@
 # OBI Energy Bridge — Reverse Engineering & Self-Hosting
 
-> ### ⚡ Fork note — adds a LoRaWAN uplink
+> ### 🐄🥚 Fork note — LoRaWAN uplink + a universal-meter ambition
 > This is a **fork** of the original by **[Aaron Christophel (atc1441)](https://github.com/atc1441/OBI_Energy_Tracker_Local_Cloud)** —
-> all of the reverse-engineering and the entire base gateway firmware below are **his work**. This fork
-> adds **one thing**: a standard **LoRaWAN OTAA (EU868) uplink**, so the OBI readers can report to any
-> LoRaWAN network server (ChirpStack/TTN) in addition to everything the base firmware already does.
-> **→ What it adds, how it's built, and the hardware notes: [`open_obi_energy_meter/LORAWAN.md`](open_obi_energy_meter/LORAWAN.md).**
+> all of the reverse-engineering and the entire base gateway firmware below are **his work**. This fork adds:
+> - ⚡ a standard **LoRaWAN OTAA (EU868) uplink** so the OBI readers report to any LoRaWAN network server
+>   (ChirpStack/TTN/Conduit) alongside everything the base firmware already does — **live on hardware**; and
+> - 🚰 a **water-meter firmware mod** (in validation) that makes the same reader poll a **Kamstrup Multical 21**
+>   over KMP — the "Eierlegende Wollmilchsau": one cheap plug, any optical meter, over LoRaWAN *and* MQTT.
+>
+> **→ Start here: [`open_obi_energy_meter/WOLLMILCHSAU.md`](open_obi_energy_meter/WOLLMILCHSAU.md)** (overview + status).
+> Deep dives: [`LORAWAN.md`](open_obi_energy_meter/LORAWAN.md) (bridge) · [`WATER-KMP.md`](open_obi_energy_meter/WATER-KMP.md) (water).
 > Everything else in this README is atc1441's original documentation, unchanged.
 
 ---
