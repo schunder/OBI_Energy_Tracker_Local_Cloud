@@ -1197,7 +1197,11 @@ static void handleUpdatePage() { server.send_P(200, "text/html", UPDATE_HTML); }
 // ---- GitHub release check + self-update from GitHub -------------------------------------------------
 // The gateway can pull its own newest release .bin straight from GitHub (built by .github/workflows/build.yml,
 // asset named "<board-target>-<tag>.bin"). HTTPS via WiFiClientSecure(setInsecure) — no cert bundle needed.
-#define GH_DEFAULT_REPO "atc1441/OBI_Energy_Tracker_Local_Cloud"
+// FORK: point the self-updater at OUR fork, NOT atc1441's — pulling atc1441's vanilla release would
+// overwrite this firmware's LoRaWAN uplink (no /api/lw, no join). Our fork's own release .bins (built by
+// the fork's workflow) carry LoRaWAN; until any are published this simply finds no update (safe no-op).
+// To intentionally take an upstream update: rebase this fork onto atc1441 latest, rebuild, release here.
+#define GH_DEFAULT_REPO "schunder/OBI_Energy_Tracker_Local_Cloud"
 
 // Accepts "owner/repo" as-is, or strips a full GitHub URL ("https://github.com/owner/repo(.git)") down to it.
 static String ghRepoNorm() {
