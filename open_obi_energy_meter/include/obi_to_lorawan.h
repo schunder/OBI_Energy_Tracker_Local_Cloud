@@ -21,3 +21,8 @@ void obi_lorawan_tick(Reader *readers, int maxReaders, uint32_t nowMs);
 void obi_lorawan_set_enabled(bool on);
 bool obi_lorawan_enabled();
 bool obi_lorawan_joined();
+
+// Diagnostics surfaced on /api/lw for bring-up: last RadioLib join/uplink return code (as a
+// string, e.g. "NO_JOIN_ACCEPT") and how many times the shared radio has been borrowed.
+String   obi_lorawan_last_state();
+uint32_t obi_lorawan_attempts();

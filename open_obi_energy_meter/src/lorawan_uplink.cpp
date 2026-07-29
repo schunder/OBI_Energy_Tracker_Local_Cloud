@@ -3,6 +3,19 @@
 #include "lorawan_secrets.h"
 #include "obi_radio_params.h"
 #include "obi_deveui.h"
+#include "board_config.h"   // LORA_RXEN_PIN / LORA_DIO2_RFSW — RF-switch scheme for THIS board
+
+// The LoRaWAN transaction reconfigures the shared SX1262 and (per obiRadioRestore in
+// obi_to_lorawan.cpp) leaves the RF switch in the wrong state — so the switch must be re-asserted
+// BEFORE the LoRaWAN tx too, or the join radiates into a disconnected antenna (radio.begin OK,
+// NO_JOIN_ACCEPT, nothing on air). Mirrors main.cpp's begin-time block exactly.
+static inline void obiLwAssertRfSwitch() {
+#if defined(LORA_RXEN_PIN) && (LORA_RXEN_PIN != RADIOLIB_NC)
+  radio.setRfSwitchPins(LORA_RXEN_PIN, RADIOLIB_NC);
+#elif LORA_DIO2_RFSW
+  radio.setDio2AsRfSwitch(true);
+#endif
+}
 
 // Maps the LoRaWAN stack onto the SAME `radio` instance the OBI master role uses (see
 // obi_radio_params.h) -- there is only ever one physical SX1262 in SHARED mode.
@@ -57,6 +70,8 @@ void LoRaWANUplink::attemptJoin() {
   const bool freshJoin = !_restoredFromNvs;
   if (freshJoin) loraNode.setADR(obilw::UseADR);
 
+  obiLwAssertRfSwitch();   // ensure the antenna is connected for THIS tx (see note above)
+
   int16_t state = loraNode.activateOTAA();
   _lastTxState = state;
   _restoredFromNvs = false;
@@ -90,6 +105,7 @@ bool LoRaWANUplink::sendUplink(const uint8_t *data, size_t len, uint8_t port) {
   uint8_t downBuf[255];
   size_t  downLen = 0;
   LoRaWANEvent_t downEvent;
+  obiLwAssertRfSwitch();   // antenna connected for the uplink tx (see note at top)
   int16_t state = loraNode.sendReceive((uint8_t *)data, len, port, downBuf, &downLen, false, nullptr, &downEvent);
   _lastTxState = state;
 

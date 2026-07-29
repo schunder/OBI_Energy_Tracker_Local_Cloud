@@ -16,8 +16,8 @@ const uint8_t  ControlFPort = 20;        // downlink: set a reader's OBI upload 
 // report every upload_interval seconds (default 25 here, up to 300 stock) and tolerate a handful
 // of missed 1 Hz beacons via their retry/backoff, so keep this well above a few seconds and
 // aggregate readers into one frame rather than uplinking more often.
-const uint32_t UplinkPeriodMs      = 300000UL;   // >= 300 s
-const uint32_t JoinRetryIntervalMs = 30000UL;
+const uint32_t UplinkPeriodMs      = 300000UL;   // >= 300 s field cadence (a joined session in NVS
+const uint32_t JoinRetryIntervalMs = 30000UL;    //   resumes across a reflash -> no fresh air join)
 const uint8_t  MaxReadersPerUplink = 3;          // caps frame size; freshest readers win (see .cpp)
 
 const bool UseADR = true;   // let the network negotiate DR; self-backs-off to more range on lost downlinks

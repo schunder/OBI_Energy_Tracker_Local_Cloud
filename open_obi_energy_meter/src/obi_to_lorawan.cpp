@@ -95,6 +95,9 @@ void obi_lorawan_set_enabled(bool on) {
 bool obi_lorawan_enabled() { return g_lwEnabled; }
 bool obi_lorawan_joined()  { return LoRaWANUplink::getInstance().isJoined(); }
 
+String   obi_lorawan_last_state() { return LoRaWANUplink::getInstance().getTxStateString(); }
+uint32_t obi_lorawan_attempts()   { return g_uplinkAttempts; }
+
 void obi_lorawan_tick(Reader *readers, int maxReaders, uint32_t nowMs) {
   if (!g_lwEnabled) return;                          // runtime-disabled -> never touch the radio
   if (nowMs < kLwStartupGraceMs) return;            // startup grace (see kLwStartupGraceMs)
