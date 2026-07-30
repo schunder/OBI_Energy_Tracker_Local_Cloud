@@ -42,6 +42,18 @@ static const u8 kmp_query_v1[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D
 #define KMP_RDY   ((volatile u32 *)0x20001024u)   // 1 once a full 0x0D-terminated frame is in
 #define KMP_MAX   64
 
+// ---- divide-by-10 with no hardware divide / no soft-division runtime ----
+// Freestanding -nostdlib: a plain `n / 10` links __aeabi_uidiv (absent). This uses only
+// shifts/adds/MULS. Correct for all u32. (Multiply is fine on M0+; only divide is missing.)
+static u32 div10(u32 n)
+{
+    u32 q = (n >> 1) + (n >> 2);   // ~0.75n
+    q += q >> 4; q += q >> 8; q += q >> 16;
+    q >>= 3;                        // ~n/10
+    u32 r = n - (((q << 2) + q) << 1);   // n - q*10
+    return q + ((r + 6) >> 4);      // correct the off-by-one
+}
+
 // ---- CRC: true-CCITT, poly 0x1021, init 0, bitwise (matches PHK kamstrup.py) ----
 static u16 kmp_crc(const u8 *d, int n)
 {
@@ -116,7 +128,7 @@ int kmp_decode(void)
     i32 e = exp + 3;
     u32 litres = mant;
     if (e >= 0) { for (int i = 0; i < e; i++) litres *= 10; }
-    else        { for (int i = 0; i < -e; i++) litres /= 10; }
+    else        { for (int i = 0; i < -e; i++) litres = div10(litres); }
 
     *KMP_IMPORT = neg ? (u32)(-(i32)litres) : litres;   // -> rides the existing LoRa report
     *KMP_RDY = 0;                          // consumed; ready for the next cycle
