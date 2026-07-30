@@ -5,6 +5,10 @@
 #include "lorawan_config.h"
 #include "lorawan_uplink.h"
 #include "payload_codec.h"
+#include "board_config.h"   // LORA_TCXO_V / LORA_RXEN_PIN / LORA_DIO2_RFSW. WITHOUT this, the RF-switch
+                            // #if in obiRadioRestore() below was a SILENT NO-OP (macros undefined) and
+                            // TCXO was unavailable -- so the OBI receive was never fully restored after a
+                            // LoRaWAN tx and the bridge went deaf to the reader after the first uplink.
 
 // ---- persisted reader_index slots (0..9) -----------------------------------------------------
 // The WP3 wire format's reader_index is a SMALL STABLE id, not the OBI gateway's RAM array
@@ -32,22 +36,20 @@ static uint8_t obiSlotFor(const uint8_t handle[3]) {
   return slot;
 }
 
-// Restore the OBI PHY after a LoRaWAN transaction reconfigured the shared SX1262. Mirrors the
-// args main.cpp's setup() passed to radio.begin() (see obi_radio_params.h) via individual
-// setters -- cheaper than a full begin() and skips redoing the SPI/ECDH bring-up.
+// Restore the OBI PHY after a LoRaWAN transaction reconfigured the shared SX1262.
+// A FULL begin() (not partial setters) is used deliberately: it replays the exact boot-time radio init,
+// including the TCXO config on DIO3 (LORA_TCXO_V) and a clean chip reset. The previous partial-setter
+// version omitted the TCXO -- a LoRaWAN transaction can drop it, leaving the PLL unlocked so OBI receive
+// went DEAF after the first uplink (the "reads once, then silent forever" symptom). begin() only re-inits
+// the SX1262 SPI/HAL; it does NOT touch the app-level OBI/ECDH/paired-reader state, so it's safe to call
+// every uplink cycle.
 static void obiRadioRestore() {
-  radio.standby();
-  radio.setFrequency(OBI_FREQ_MHZ);
-  radio.setBandwidth(OBI_BW_KHZ);
-  radio.setSpreadingFactor(OBI_SF);
-  radio.setCodingRate(OBI_CR);
-  radio.setSyncWord(OBI_SYNCWORD);
-  radio.setOutputPower(OBI_TXPWR_DBM);
-  radio.setPreambleLength(OBI_PREAMBLE);
+  radio.begin(OBI_FREQ_MHZ, OBI_BW_KHZ, OBI_SF, OBI_CR,
+              OBI_SYNCWORD, OBI_TXPWR_DBM, OBI_PREAMBLE, LORA_TCXO_V, false);
 #if defined(LORA_RXEN_PIN) && (LORA_RXEN_PIN != RADIOLIB_NC)
   radio.setRfSwitchPins(LORA_RXEN_PIN, RADIOLIB_NC);
 #elif LORA_DIO2_RFSW
-  radio.setDio2AsRfSwitch(true);
+  radio.setDio2AsRfSwitch(true);   // now actually compiled (board_config.h is included) -- was a no-op before
 #endif
   radio.setCRC(2);
   radio.setCurrentLimit(140.0);
