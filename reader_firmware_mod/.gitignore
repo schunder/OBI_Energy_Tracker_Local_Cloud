@@ -1,0 +1,5 @@
+# regenerable build intermediates (keep .bin/.S/.ld -- the bisect record)
+build/*.o
+build/*.elf
+build/*.map
+build/*.sym

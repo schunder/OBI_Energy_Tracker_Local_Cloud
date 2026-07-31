@@ -55,7 +55,7 @@ static u32 div10(u32 n)
 }
 
 // ---- CRC: true-CCITT, poly 0x1021, init 0, bitwise (matches PHK kamstrup.py) ----
-static u16 kmp_crc(const u8 *d, int n)
+static u16 kmp_crc(const volatile u8 *d, int n)
 {
     u32 reg = 0;
     for (int i = 0; i < n; i++) {
@@ -94,25 +94,27 @@ int kmp_decode(void)
 {
     if (!*KMP_RDY) return 0;
 
-    // destuff into a local copy: 0x1B <x> -> (x ^ 0xFF)
-    u8 f[KMP_MAX]; int m = 0;
+    // Destuff IN PLACE inside the RX scratch buffer (0x1B <x> -> x^0xFF). Destuffing only ever removes
+    // bytes, so the write index never overtakes the read index -- safe in place, and NO 64-byte stack
+    // buffer (that overflowed the reader's tiny stack -> hardfault -> rollback on the first attempt).
+    // The RX ISR ignores the buffer while KMP_RDY==1, so it's stable during decode.
+    volatile u8 *f = KMP_BUF;
+    int m = 0;
     u32 n = *KMP_LEN;
-    for (u32 i = 0; i < n && m < KMP_MAX; i++) {
-        u8 c = KMP_BUF[i];
-        if (c == 0x1B && i + 1 < n) { i++; f[m++] = KMP_BUF[i] ^ 0xFF; }
+    for (u32 i = 0; i < n; i++) {
+        u8 c = f[i];
+        if (c == 0x1B && i + 1 < n) { i++; f[m++] = (u8)(f[i] ^ 0xFF); }
         else                        {        f[m++] = c; }
     }
-    if (m < 10 || f[0] != 0x40) return 0;          // not a valid reply header
-    // strip trailing 0x0D, CRC over the rest (incl. its 2 CRC bytes) must be 0
-    if (f[m-1] == 0x0D) m--;
-    if (kmp_crc(f, m) != 0) return 0;              // CRC fail
+    if (m < 10 || f[0] != 0x40) { *KMP_RDY = 0; return 0; }   // not a valid reply header
+    if (f[m-1] == 0x0D) m--;                                  // strip trailing stop
+    if (kmp_crc(f, m) != 0)     { *KMP_RDY = 0; return 0; }   // CRC over frame (incl CRC bytes) must be 0
 
     // fields (offsets validated against the real Multical 21 capture):
     // [3..4]=reg, [5]=unit, [6]=mantlen, [7]=sign/exp, [8..]=mantissa BE
-    u8 unit    = f[5];
     u8 mantlen = f[6];
     u8 se      = f[7];
-    if (mantlen == 0 || mantlen > 4 || 8 + mantlen > m) return 0;
+    if (mantlen == 0 || mantlen > 4 || 8 + mantlen > m) { *KMP_RDY = 0; return 0; }
 
     u32 mant = 0;
     for (int i = 0; i < mantlen; i++) mant = (mant << 8) | f[8 + i];
@@ -124,7 +126,6 @@ int kmp_decode(void)
     // convert to LITRES (integer) so it fits the u32 import field:
     //   value_m3 = mant * 10^exp   (unit 0x28 = 40 = m3)
     //   litres   = value_m3 * 1000 = mant * 10^(exp+3)
-    (void)unit;                            // (kept for a future multi-register/unit branch)
     i32 e = exp + 3;
     u32 litres = mant;
     if (e >= 0) { for (int i = 0; i < e; i++) litres *= 10; }
@@ -133,4 +134,35 @@ int kmp_decode(void)
     *KMP_IMPORT = neg ? (u32)(-(i32)litres) : litres;   // -> rides the existing LoRa report
     *KMP_RDY = 0;                          // consumed; ready for the next cycle
     return 1;
+}
+
+// ---- best-effort baud retune: meter optical UART (group A) 9600 -> ~1200 ----
+// The reader re-configures the UART to its normal baud each wake (just before our hook runs); we bump
+// group-A's clock prescaler by +3 (/8) to reach ~1200. f_CLK-independent. UNVERIFIED (SWD read was the
+// intended confirmation) -- but a wrong write here only mis-tunes the UART (no meter read), never faults.
+static void kmp_set_baud_1200(void)
+{
+    volatile u16 *smr = (volatile u16 *)0x40041126u;   // group-A clock-select; prescaler in the low nibble
+    u16 v = *smr;
+    u16 pre = (u16)((v & 0x000Fu) + 3u);               // +3 prescaler shifts = /8 -> 9600->1200
+    *smr = (u16)((v & ~0x000Fu) | (pre & 0x000Fu));
+}
+
+// ---- one-shot per read cycle (called from the entry.S trampoline). Pipelined + bounded, never blocks ----
+//   1. decode the reply collected since the LAST cycle -> volume into the energy field,
+//   2. retune to 1200 and fire a fresh KMP query; its reply collects async before the next cycle.
+void kmp_arm(void)
+{
+#ifdef KMP_SENTINEL_ONLY
+    // HW bisect stage v94 (2026-07-31): prove the injection+trampoline execute on the real reader
+    // WITHOUT touching baud or the optical port. If this survives boot (no bootloader rollback) where
+    // the full v92/v93 armed images rolled back, the disruptor is isolated to kmp_set_baud_1200()/
+    // kmp_poll(), not the splice. The sentinel also rides the reader->gateway report via the import field.
+    *KMP_IMPORT = 0x0000ABCDu;
+    return;
+#else
+    kmp_decode();          // parse previous reply (no-op on the first cycle / if none arrived)
+    kmp_set_baud_1200();
+    kmp_poll();            // installs the RX collector + transmits the query (all bounded)
+#endif
 }
