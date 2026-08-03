@@ -21,3 +21,9 @@ __pycache__/
 *.id2
 *.nam
 *.til
+
+# reader_firmware_mod: build intermediates (released .bin files stay tracked)
+reader_firmware_mod/build/*.o
+reader_firmware_mod/build/*.elf
+reader_firmware_mod/build/*.map
+reader_firmware_mod/build/*.sym

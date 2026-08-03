@@ -26,20 +26,36 @@ typedef unsigned short u16;
 typedef unsigned int   u32;
 typedef int            i32;
 
+// The fixed addresses below are the reader's real memory map. They are #ifndef-guarded so the
+// host test harness (test/test_kmp_decode.c) can point them at ordinary arrays and exercise the
+// decoder natively -- the target build is unaffected and still gets these exact values.
+#ifndef KMP_TX_ADDR
 #define KMP_TX_ADDR   0x59A4u                 // sendOptical(buf,len) — Thumb
+#endif
+#ifndef KMP_RXCB_SLOT
 #define KMP_RXCB_SLOT ((volatile u32 *)0x2000009Cu)
+#endif
+#ifndef KMP_IMPORT
 #define KMP_IMPORT    ((volatile u32 *)0x20000D68u)
+#endif
 
 typedef void (*send_fn)(const u8 *buf, int len);
+#ifndef vendor_send_optical
 #define vendor_send_optical ((send_fn)(KMP_TX_ADDR | 1u))
+#endif
 
 // fixed request for register 0x0044 (volume) — constant, so no runtime CRC/stuffing needed
 static const u8 kmp_query_v1[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
 
 // RX assembly state in verified-safe scratch RAM (0x20001000+ block, per README)
+// NOTE (2026-08-03 review): real stack top is 0x200016b0 and the stack grows DOWN toward these,
+// leaving ~0x670 bytes of headroom that has never been measured. A 64-byte stack buffer already
+// caused one hardfault here. Measure actual stack depth before trusting this placement.
+#ifndef KMP_BUF
 #define KMP_BUF   ((volatile u8  *)0x20001040u)   // raw received bytes (pre-destuff)
 #define KMP_LEN   ((volatile u32 *)0x20001020u)   // count in KMP_BUF
 #define KMP_RDY   ((volatile u32 *)0x20001024u)   // 1 once a full 0x0D-terminated frame is in
+#endif
 #define KMP_MAX   64
 
 // ---- divide-by-10 with no hardware divide / no soft-division runtime ----
@@ -82,7 +98,9 @@ void kmp_poll(void)
 {
     *KMP_LEN = 0;
     *KMP_RDY = 0;
-    *KMP_RXCB_SLOT = ((u32)&kmp_rx_byte) | 1u;   // install our collector (Thumb bit)
+    // two-step cast: unsigned long is 32-bit on ARM EABI (no-op on target), and it keeps the
+    // host test harness compiling on 64-bit builds
+    *KMP_RXCB_SLOT = ((u32)(unsigned long)&kmp_rx_byte) | 1u;   // install our collector (Thumb bit)
     vendor_send_optical(kmp_query_v1, sizeof kmp_query_v1);
     // reply is gathered by kmp_rx_byte via the ISR; parsed later by kmp_decode()
     // (called from the same read-cycle tail after a bounded wait — no spin here).
@@ -108,7 +126,11 @@ int kmp_decode(void)
     }
     if (m < 10 || f[0] != 0x40) { *KMP_RDY = 0; return 0; }   // not a valid reply header
     if (f[m-1] == 0x0D) m--;                                  // strip trailing stop
-    if (kmp_crc(f, m) != 0)     { *KMP_RDY = 0; return 0; }   // CRC over frame (incl CRC bytes) must be 0
+    // CRC covers the frame from the ADDRESS byte through the CRC bytes -- the 0x40 start
+    // delimiter is NOT included. Verified on the real captured reply:
+    //   crc(40 3F 10 00 44 ...) = 0x2BBF (never zero)   <- what this line did before
+    //   crc(   3F 10 00 44 ...) = 0x0000 (correct)
+    if (kmp_crc(f + 1, m - 1) != 0) { *KMP_RDY = 0; return 0; }
 
     // fields (offsets validated against the real Multical 21 capture):
     // [3..4]=reg, [5]=unit, [6]=mantlen, [7]=sign/exp, [8..]=mantissa BE
@@ -142,10 +164,16 @@ int kmp_decode(void)
 // intended confirmation) -- but a wrong write here only mis-tunes the UART (no meter read), never faults.
 static void kmp_set_baud_1200(void)
 {
+#ifdef KMP_NO_BAUD_WRITE
+    return;                                            // host test harness: no MMIO on this machine
+#else
     volatile u16 *smr = (volatile u16 *)0x40041126u;   // group-A clock-select; prescaler in the low nibble
     u16 v = *smr;
     u16 pre = (u16)((v & 0x000Fu) + 3u);               // +3 prescaler shifts = /8 -> 9600->1200
-    *smr = (u16)((v & ~0x000Fu) | (pre & 0x000Fu));
+    if (pre > 0x0Fu) return;                           // would wrap the nibble into a garbage
+                                                       // prescaler -- leave the port alone instead
+    *smr = (u16)((v & ~0x000Fu) | pre);
+#endif
 }
 
 // ---- one-shot per read cycle (called from the entry.S trampoline). Pipelined + bounded, never blocks ----
