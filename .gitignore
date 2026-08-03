@@ -27,3 +27,6 @@ reader_firmware_mod/build/*.o
 reader_firmware_mod/build/*.elf
 reader_firmware_mod/build/*.map
 reader_firmware_mod/build/*.sym
+
+# probe build intermediate (the released reader_probe_*.bin stays tracked)
+reader_firmware_mod/build/probe.bin
