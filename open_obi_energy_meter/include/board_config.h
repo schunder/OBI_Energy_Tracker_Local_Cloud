@@ -100,3 +100,22 @@
 #else
   #error "No board selected. Add -D OBI_BOARD_HELTEC_S3 (or _TTGO_TBEAM_SX1262 / _OBI_C3 / _XIAO_ESP32S3 / _CUSTOM) to build_flags in platformio.ini"
 #endif
+
+// ---- RF-switch contract ------------------------------------------------------------------------
+// Every RF-switch site is written as:
+//     #if defined(LORA_RXEN_PIN) && (LORA_RXEN_PIN != RADIOLIB_NC)
+//       radio.setRfSwitchPins(...);
+//     #elif LORA_DIO2_RFSW
+//       radio.setDio2AsRfSwitch(true);
+//     #endif
+// If a board preset forgets LORA_DIO2_RFSW, the preprocessor evaluates the undefined macro as 0
+// and compiles out ALL antenna-switch handling -- with no diagnostic. The result is a radio that
+// initialises fine and transmits into a disconnected antenna: exactly the failure that cost a week
+// on the OBI C3 (join TX radiating nothing, zero packets at the gateway from 1 m). Fail the build
+// instead of shipping a silently deaf node.
+#if !defined(LORA_RXEN_PIN)
+  #error "board_config.h: this board preset must define LORA_RXEN_PIN (use RADIOLIB_NC if the module has no separate RXEN line)"
+#endif
+#if !defined(LORA_DIO2_RFSW)
+  #error "board_config.h: this board preset must define LORA_DIO2_RFSW (true if the antenna switch is driven from the SX126x DIO2 pin, false otherwise)"
+#endif

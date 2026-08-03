@@ -1,12 +1,21 @@
 #include "obi_deveui.h"
 
-// New fleet utility code: this is the first "electricity via OBI-protocol bridge" node type
-// (distinct from 0x02 water / 0x03 gas / 0x06 combi already used by SeeedXIAOLoRaWAN etc.).
-// Hardware code 0x01 matches the existing fleet convention for Seeed XIAO ESP32-S3 + Wio-SX1262
-// (same physical board this OBI gateway runs on).
+// Fleet DevEUI convention: FE | utility | hardware | low 40 bits of the chip factory ID.
+//
+// Utility 0x07 = "electricity via OBI-protocol bridge", a new type (0x02 water / 0x03 gas /
+// 0x06 combi are already taken by SeeedXIAOLoRaWAN etc.).
+//
+// Hardware 0x07 = the OBI/heyOBI mains plug (ESP32-C3 + SX1262 on a Ra-03SCH module). This was
+// 0x01 until 2026-08-03, copied from the XIAO ESP32-S3 preset with a comment claiming it was "the
+// same physical board" -- it is not, and sharing a hardware code with an unrelated board defeats
+// the whole point of the byte. Allocated codes: 01 XIAO ESP32-S3, 02 dnt-TRX-ST1, 03 DX-PJ26+LR20,
+// 04 dnt KlimaLux, 05 XIAO nRF52840, 06 Ebyte E77, 07 OBI C3 plug.
+//
+// ⚠️ CHANGING THIS CHANGES THE DevEUI. The device must be re-registered on the Conduit under the
+// new DevEUI before it will join again -- see docs/OBI_REMEDIATION_PLAN.md R0.5/R2.1.
 #define OBI_DEVEUI_MARKER   0xFE
 #define OBI_DEVEUI_UTILITY  0x07
-#define OBI_DEVEUI_HARDWARE 0x01
+#define OBI_DEVEUI_HARDWARE 0x07
 
 uint64_t obi_build_deveui() {
   uint64_t mac    = ESP.getEfuseMac();       // 48-bit factory MAC (Espressif OUI)

@@ -995,7 +995,17 @@ static void handleUpdatePage() { server.send_P(200, "text/html", UPDATE_HTML); }
 // ---- GitHub release check + self-update from GitHub -------------------------------------------------
 // The gateway can pull its own newest release .bin straight from GitHub (built by .github/workflows/build.yml,
 // asset named "<board-target>-<tag>.bin"). HTTPS via WiFiClientSecure(setInsecure) — no cert bundle needed.
-#define GH_LATEST_URL "https://api.github.com/repos/atc1441/OBI_Energy_Tracker_Local_Cloud/releases/latest"
+// ⚠️ THIS FORK ADDS LoRaWAN, UPSTREAM DOES NOT. Pointing this at atc1441's releases (as it did
+// until 2026-08-03) means one click on the update button silently downgrades a live field node to
+// vanilla OBI: the reader and MQTT keep working, so it looks fine, but the LoRaWAN uplink is gone
+// and the node goes quiet on the LNS with no error anywhere.
+//
+// It now targets this fork's releases. If none are published the API returns 404 and the updater
+// simply reports "no update available" -- the safe failure. Override at build time to point
+// somewhere else deliberately.
+#ifndef GH_LATEST_URL
+#define GH_LATEST_URL "https://api.github.com/repos/schunder/OBI_Energy_Tracker_Local_Cloud/releases/latest"
+#endif
 
 // compare dotted numeric versions (leading 'v' tolerated); true if a > b.
 static bool verNewer(const char *a, const char *b) {
