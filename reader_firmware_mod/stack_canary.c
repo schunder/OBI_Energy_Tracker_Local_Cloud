@@ -43,6 +43,16 @@ typedef unsigned int   u32;
 #define MAGIC_ADDR       ((volatile u32 *)0x2000101Cu)  // "already painted" flag (below PAINT_LO)
 #define MAGIC_VAL        0xCA9A5EEDu
 #define REPORT_ADDR      ((volatile u32 *)0x20000D68u)  // import field -> rides the LoRa report
+#define TURN_ADDR        ((volatile u32 *)0x20001018u)  // which item to report this cycle
+
+// ---- state the read session leaves behind, worth reading from the safe phase ----------------
+// f_CLK is a RUNTIME VARIABLE, not a constant: 0x5AA4 loads it from RAM here and passes it as
+// arg0 to the UART setup (0xDCB4 -> 0x94BC). Reporting it settles the core-clock question on
+// real silicon instead of by inference.
+#define FCLK_ADDR        ((volatile u32 *)0x20000390u)
+// Group-A SAU (the pair whose data register the TX primitive @0x5AD0 writes):
+#define SAU_A_SMR        ((volatile u16 *)0x40041126u)  // low nibble = clock prescaler
+#define SAU_A_SDR        ((volatile u16 *)0x40041310u)  // divisor in bits [15:9]
 
 static inline u32 read_sp(void)
 {
@@ -80,23 +90,54 @@ void canary_probe(void)
         return;
     }
 
-    // Report the high-water ADDRESS itself (easiest to read on the gateway) plus, in the top
-    // byte, how many bytes of headroom remain above PAINT_LO. Both are useful:
-    //   value & 0x00FFFFFF = deepest address, low 24 bits (0x20000000 base is implicit)
-    //   value >> 24        = (deepest - PAINT_LO) / 16, saturated at 255 -- the margin
-    u32 margin = (deepest - PAINT_LO) >> 4;
-    if (margin > 255u) margin = 255u;
-    *REPORT_ADDR = ((margin & 0xFFu) << 24) | (deepest & 0x00FFFFFFu);
+    // One u32 of report per cycle, so rotate through the things worth knowing. The top nibble is
+    // an item tag; the gateway just prints the raw value and you decode by tag.
+    u32 turn = (*TURN_ADDR) & 3u;
+    *TURN_ADDR = turn + 1u;
+
+    switch (turn) {
+    case 0:  // stack high-water: 0x1xxxxxxx, low 24 bits = the deepest address touched
+        *REPORT_ADDR = 0x10000000u | (deepest & 0x00FFFFFFu);
+        break;
+    case 1:  // f_CLK as the firmware itself believes it: 0x2 + Hz/16 (fits 28 bits up to 4 GHz)
+        *REPORT_ADDR = 0x20000000u | ((*FCLK_ADDR >> 4) & 0x0FFFFFFFu);
+        break;
+    case 2:  // live group-A SAU: 0x3 | SDR<<8 | prescaler nibble
+        *REPORT_ADDR = 0x30000000u | ((u32)(*SAU_A_SDR) << 8) | ((*SAU_A_SMR) & 0x000Fu);
+        break;
+    default: // raw f_CLK low 28 bits, to cross-check case 1 without the shift
+        *REPORT_ADDR = 0x40000000u | (*FCLK_ADDR & 0x0FFFFFFFu);
+        break;
+    }
 }
 
 // ---- how to read the result on the gateway ----------------------------------------------------
-//   0x00C0FFEE            -> painted, waiting for a read session to happen
-//   0x00D00D00            -> nothing touched the painted region at all (stack never came near)
-//   0xMM0010xx            -> high-water at 0x200010xx; MM = free 16-byte units above 0x20001020
+//   0x00C0FFEE     -> painted, waiting for a read session to happen
+//   0x00D00D00     -> nothing touched the painted region (stack never came near)
+//   0x1_0010xx     -> STACK high-water at 0x200010xx
+//   0x2_xxxxxxx    -> f_CLK / 16, i.e. multiply by 16 for Hz   (expect 0x016E3600 = 24 MHz)
+//   0x3_SSSS_p     -> group-A SAU: SDR = bits[27:8], prescaler = low nibble
+//   0x4_xxxxxxx    -> f_CLK raw, low 28 bits (cross-check of tag 2)
 //
-// INTERPRETATION
-//   deepest > 0x20001100  -> the stack never comes near the KMP scratch; the stack hypothesis for
-//                            the v9x faults is dead, and KMP_BUF at 0x20001040 is safe where it is.
-//   deepest <= 0x20001080 -> the read session runs deep. KMP_BUF at 0x20001040 is in the blast
-//                            radius and must move, and the v9x trampoline's extra frame becomes a
-//                            live suspect again.
+// WHAT THE ANSWERS DECIDE
+//   STACK  > 0x20001100 -> stack never nears the KMP scratch: that hypothesis for the v9x faults
+//                          dies and KMP_BUF at 0x20001040 is safe where it is.
+//          <= 0x20001080 -> the read session runs deep; KMP_BUF must move and the trampoline's
+//                          extra frame is a live suspect again.
+//
+//   f_CLK  24 MHz -> confirms the read-session UART really is 115200 (24e6 / 208 = 115384, +0.16%),
+//                   and the long-held "optical link is 9600" assumption is WRONG. The whole KMP
+//                   plan retunes 9600 -> 1200; if the link is 115200 the target is 1200 from
+//                   115200, a different prescaler, and every baud calculation must be redone.
+//          2 MHz  -> the 9600 reading survives and something else explains the 115200 constant
+//                   constructed at 0x5A00.
+//
+//   SDR/prescaler -> the ground truth. SDR 0xCE00 (divisor 103) with prescaler 0 at 24 MHz is
+//                   115200; the same SDR with prescaler 3 is 14400, not 1200. Read it, do not
+//                   infer it.
+//
+// Evidence this probe exists to settle (all static, from reader_stock_v57.bin):
+//   0x5A00  movs r0,#0xE1 / lsls r0,#9      -> r0 = 115200, passed into the read session's UART setup
+//   0x5AA4  mov r1,r0 ; ldr r0,[0x20000390] -> setup(f_CLK from RAM, baud=115200)
+//   0xDCB4  push{r0,r1,...} ; sub sp,#4     -> [sp,#8] is that baud, handed to 0x94BC at 0xDD2C
+//   0xDD34  b .                             -> a failed baud calculation hangs the firmware forever
