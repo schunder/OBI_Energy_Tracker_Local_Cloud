@@ -22,3 +22,26 @@ entry_probe:
     bl   canary_probe   // clobbers LR/r0-r3 — all dead here
     movs r0, #0         // replayed original instruction 1
     pop  {r3-r7, pc}    // replayed original instruction 2 -> returns to sub_C0A4's caller
+
+// --- entry_probe_report --------------------------------------------------
+// v100. Replaces the 4-byte `LDR R1,=unk_20000D68 ; ADDS R1,#8` at 0x7800 inside sub_77B4 --
+// the report-builder path hooks.c:132 records as the one this reader ACTUALLY uses (an
+// unconditional sentinel at the rival 0x75EE site never showed up live). On entry R0 holds the
+// power value about to be stored via `BL sub_43A6` right after we return; we substitute the
+// probe's diagnostic word, then replay the two instructions we displaced.
+//
+// This exists because v99 wrote 0x20000D68 directly -- which is import at +0, a field the vendor
+// rewrites every telegram, so the sentinel could never survive to the gateway.
+//
+// LR must be preserved: the replaced code was straight-line, and our own `bl` clobbers LR.
+.equ obi_report_struct, 0x20000D68
+
+.section .text.entry_probe_report, "ax", %progbits
+.global entry_probe_report
+.thumb_func
+entry_probe_report:
+    push {lr}
+    bl   canary_probe_report   // r0 = real power in -> diagnostic (or power) out
+    ldr  r1, =obi_report_struct
+    adds r1, #8                // replayed: r1 = &power field
+    pop  {pc}                  // -> sub_77B4 @0x7804, which stores r0 via sub_43A6

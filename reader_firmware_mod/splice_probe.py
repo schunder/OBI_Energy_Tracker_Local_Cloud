@@ -25,19 +25,26 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "reader_stock_v57.bin"
-DST = HERE / "build" / "reader_probe_v99.bin"
+DST = HERE / "build" / "reader_probe_v101.bin"
 BLOB = HERE / "build" / "probe.bin"
 SYMS = HERE / "build" / "probe.sym"
 BASE = 0x4000
 
-# The decode-phase default slot: `movs r0,#0 ; pop {r3-r7,pc}`.
-SITE = 0xC0EA
-ORIG = bytes([0x00, 0x20, 0xF8, 0xBD])
-ENTRY = "entry_probe"
+# v100: the REPORT-BUILDER site inside sub_77B4 -- `LDR R1,=unk_20000D68 ; ADDS R1,#8` at 0x7800,
+# with the power value in R0 about to be stored by the `BL sub_43A6` right after. hooks.c:132
+# records this as the path this reader actually uses (a sentinel at the rival 0x75EE never showed
+# up live). We become the LAST writer of the reported value.
+#
+# v99 used the decode site 0xC0EA and wrote 0x20000D68 directly. That address is import at +0,
+# which sub_77B4 rewrites every telegram -- so v99's sentinel was clobbered before transmission
+# and could never have been seen. Not a negative result about the hook; a bug in the readout.
+SITE = 0x7800
+ORIG = bytes([0x06, 0x49, 0x08, 0x31])
+ENTRY = "entry_probe_report"
 
 # softver: 91 canary, 92..98 the armed attempts, 99 = this probe. Must differ from the
-# reader's current version or the gateway treats the OTA as a no-op.
-SOFTVER = 99
+# reader's current version or the gateway treats the OTA as a no-op. 99 = v99 probe, 100 = this.
+SOFTVER = 101
 SOFTVER_OFFSETS = (0x8B36, 0x8B80)
 
 

@@ -7,11 +7,12 @@ MEMORY
   HOOKS (rx) : ORIGIN = 0xEE08, LENGTH = 0x1000
 }
 
-ENTRY(entry_probe)
+ENTRY(entry_probe_report)
 
 SECTIONS
 {
   .text : {
+    KEEP(*(.text.entry_probe_report))
     KEEP(*(.text.entry_probe))
     *(.text*)
     *(.rodata*)

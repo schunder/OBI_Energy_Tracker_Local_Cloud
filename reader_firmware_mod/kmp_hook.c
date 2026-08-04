@@ -29,28 +29,42 @@ typedef int            i32;
 // The fixed addresses below are the reader's real memory map. They are #ifndef-guarded so the
 // host test harness (test/test_kmp_decode.c) can point them at ordinary arrays and exercise the
 // decoder natively -- the target build is unaffected and still gets these exact values.
+// ⚠️ REGISTER MAP CORRECTED 2026-08-04 BY LIVE MEASUREMENT (probe v101). Everything below used to
+// point at SAU **group A**, which is NOT the meter. Measured on hardware at f_CLK = 64 MHz:
+//     group A  cfg 0x40041120  prescaler 0x40041126 = 2  -> 115200   SDR/ch1 always 0x0000
+//     group B  cfg 0x40041560  prescaler 0x40041566 = 5  ->   9600   ch1 SDR live: 32 A3 77 ...
+// Group B is the one with changing receive data, and 9600 8N1 is the SML optical standard. The
+// meter link is group B. The old map came from labelling the first SAU bank found as "optical".
+//
+//   role            group A (WRONG)   group B (CORRECT, the meter)
+//   prescaler       0x40041126        0x40041566
+//   TX data         0x40041310        0x40041748   via primitive @0x5F64
+//   RX data         0x40041312        0x4004174A   read by handler @0x635E
+//   RX callback     0x2000009C        0x20000074   (struct 0x20000070, ptr at +4)
 #ifndef KMP_TX_ADDR
-#define KMP_TX_ADDR   0x59A4u                 // sendOptical(buf,len) — Thumb
+#define KMP_TX_ADDR   0x5F64u                 // group-B writeByte: strb r0,[0x40041748] — Thumb
 #endif
 #ifndef KMP_RXCB_SLOT
-#define KMP_RXCB_SLOT ((volatile u32 *)0x2000009Cu)
+#define KMP_RXCB_SLOT ((volatile u32 *)0x20000074u)  // group-B RX callback ptr (struct 0x20000070 +4)
 #endif
 #ifndef KMP_IMPORT
 #define KMP_IMPORT    ((volatile u32 *)0x20000D68u)
 #endif
 
-typedef void (*send_fn)(const u8 *buf, int len);
-#ifndef vendor_send_optical
-#define vendor_send_optical ((send_fn)(KMP_TX_ADDR | 1u))
+// NOTE: 0x5F64 is a single-BYTE writer (`strb r0,[r1,#8]`), not a buffer sender like the old
+// 0x59A4 assumption. kmp_poll() must therefore loop over the query bytes itself.
+typedef void (*send_byte_fn)(u8 b);
+#ifndef vendor_send_byte
+#define vendor_send_byte ((send_byte_fn)(KMP_TX_ADDR | 1u))
 #endif
 
 // fixed request for register 0x0044 (volume) — constant, so no runtime CRC/stuffing needed
 static const u8 kmp_query_v1[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
 
-// RX assembly state in verified-safe scratch RAM (0x20001000+ block, per README)
-// NOTE (2026-08-03 review): real stack top is 0x200016b0 and the stack grows DOWN toward these,
-// leaving ~0x670 bytes of headroom that has never been measured. A 64-byte stack buffer already
-// caused one hardfault here. Measure actual stack depth before trusting this placement.
+// RX assembly state in verified-safe scratch RAM (0x20001000+ block, per README).
+// MEASURED 2026-08-04 (probe v100/v101): the stack high-water mark is 0x200014C0..0x200014F0,
+// i.e. ~480-496 B used from the 0x200016B0 top, leaving >1100 B of clearance above KMP_BUF.
+// This placement is safe -- no longer an assumption.
 #ifndef KMP_BUF
 #define KMP_BUF   ((volatile u8  *)0x20001040u)   // raw received bytes (pre-destuff)
 #define KMP_LEN   ((volatile u32 *)0x20001020u)   // count in KMP_BUF
@@ -101,7 +115,9 @@ void kmp_poll(void)
     // two-step cast: unsigned long is 32-bit on ARM EABI (no-op on target), and it keeps the
     // host test harness compiling on 64-bit builds
     *KMP_RXCB_SLOT = ((u32)(unsigned long)&kmp_rx_byte) | 1u;   // install our collector (Thumb bit)
-    vendor_send_optical(kmp_query_v1, sizeof kmp_query_v1);
+    // 0x5F64 writes ONE byte to the group-B TX data register, so send the frame byte by byte.
+    // (The old code called 0x59A4 as sendOptical(buf,len) -- wrong primitive AND wrong UART.)
+    for (u32 i = 0; i < sizeof kmp_query_v1; i++) vendor_send_byte(kmp_query_v1[i]);
     // reply is gathered by kmp_rx_byte via the ISR; parsed later by kmp_decode()
     // (called from the same read-cycle tail after a bounded wait — no spin here).
 }
@@ -167,9 +183,13 @@ static void kmp_set_baud_1200(void)
 #ifdef KMP_NO_BAUD_WRITE
     return;                                            // host test harness: no MMIO on this machine
 #else
-    volatile u16 *smr = (volatile u16 *)0x40041126u;   // group-A clock-select; prescaler in the low nibble
+    // group-B clock-select (the METER's UART). Measured live: prescaler 5 = 9600 at f_CLK 64 MHz.
+    // 1200 needs prescaler 8 with the same divisor 103 (SDR 0xCE00): 64e6/2^8 = 250 kHz, /208 =
+    // 1201.9 baud (+0.16%). So the shift is +3 from the MEASURED 5, giving 8 -- the old code applied
+    // +3 to group A's 2, which would have produced 5 on the wrong peripheral entirely.
+    volatile u16 *smr = (volatile u16 *)0x40041566u;   // group-B clock-select; prescaler in low nibble
     u16 v = *smr;
-    u16 pre = (u16)((v & 0x000Fu) + 3u);               // +3 prescaler shifts = /8 -> 9600->1200
+    u16 pre = (u16)((v & 0x000Fu) + 3u);               // 5 -> 8  (/8: 9600 -> 1200)
     if (pre > 0x0Fu) return;                           // would wrap the nibble into a garbage
                                                        // prescaler -- leave the port alone instead
     *smr = (u16)((v & ~0x000Fu) | pre);

@@ -50,9 +50,29 @@ typedef unsigned int   u32;
 // arg0 to the UART setup (0xDCB4 -> 0x94BC). Reporting it settles the core-clock question on
 // real silicon instead of by inference.
 #define FCLK_ADDR        ((volatile u32 *)0x20000390u)
-// Group-A SAU (the pair whose data register the TX primitive @0x5AD0 writes):
+// TWO SAU pairs exist and we must know which one is the meter's optical link.
+//   group A: config base 0x40041120, prescaler @+6; SDR pair 0x40041310 / 0x40041312.
+//            The TX primitive @0x5AD0 writes 0x40041310 and the RX handler @0x63C0 reads
+//            0x40041312 -- so this was assumed to be the optical link.
+//   group B: config base 0x40041560, prescaler @+6; SDR pair 0x40041748 / 0x4004174A.
+//            0xDC60 writes SDR=0xCE00 (divisor 103) here directly.
+// At the MEASURED f_CLK of 64 MHz, divisor 103 is 9600 at prescaler 5 and 1200 at prescaler 8,
+// while group A's live prescaler of 2 means 115200. Reading B's prescaler decides which pair
+// actually carries the 9600 SML link -- and therefore which one a KMP retune must target.
 #define SAU_A_SMR        ((volatile u16 *)0x40041126u)  // low nibble = clock prescaler
 #define SAU_A_SDR        ((volatile u16 *)0x40041310u)  // divisor in bits [15:9]
+#define SAU_A_SDR1       ((volatile u16 *)0x40041312u)
+#define SAU_B_SMR        ((volatile u16 *)0x40041566u)
+#define SAU_B_SDR        ((volatile u16 *)0x40041748u)
+#define SAU_B_SDR1       ((volatile u16 *)0x4004174Au)
+
+// v100: the report-builder entry point. canary_probe() below writes 0x20000D68 (= import at +0),
+// which the vendor report builder sub_77B4 OVERWRITES on every telegram -- so its sentinel can
+// never reach the gateway. This variant is spliced at 0x7800 inside sub_77B4 instead, the path
+// hooks.c:132 records as the one this reader actually uses, and RETURNS the diagnostic in r0 so it
+// lands in the power field (+8) as the last writer. Values stay < 0x80000000 so the signed power
+// field shows them as positive.
+u32 canary_probe_report(u32 power_in);
 
 static inline u32 read_sp(void)
 {
@@ -63,20 +83,19 @@ static inline u32 read_sp(void)
 
 // Returns the deepest (lowest) address still showing the pattern's absence, i.e. the high-water
 // mark. 0 while still painting or if nothing was touched.
-void canary_probe(void)
+static u32 probe_core(void)
 {
     u32 sp = read_sp();
     u32 hi = sp - SP_MARGIN;
     hi &= ~3u;
 
-    if (hi <= PAINT_LO) return;                 // nothing sane to paint; bail out quietly
+    if (hi <= PAINT_LO) return 0;               // nothing sane to paint; bail out quietly
 
     if (*MAGIC_ADDR != MAGIC_VAL) {
         // ---- first call: paint, and report a recognisable "armed" value ----
         for (u32 a = PAINT_LO; a < hi; a += 4) *(volatile u32 *)a = PATTERN;
         *MAGIC_ADDR = MAGIC_VAL;
-        *REPORT_ADDR = 0x00C0FFEEu;             // armed sentinel
-        return;
+        return 0x00C0FFEEu;                     // armed sentinel
     }
 
     // ---- later calls: find the lowest address that is no longer PATTERN ----
@@ -85,31 +104,36 @@ void canary_probe(void)
         if (*(volatile u32 *)a != PATTERN) { deepest = a; break; }
     }
 
-    if (deepest == 0) {
-        *REPORT_ADDR = 0x00D00D00u;             // nothing below `hi` was ever touched
-        return;
-    }
+    if (deepest == 0) return 0x00D00D00u;       // nothing below `hi` was ever touched
 
     // One u32 of report per cycle, so rotate through the things worth knowing. The top nibble is
     // an item tag; the gateway just prints the raw value and you decode by tag.
-    u32 turn = (*TURN_ADDR) & 3u;
+    u32 turn = (*TURN_ADDR) & 7u;
     *TURN_ADDR = turn + 1u;
 
-    switch (turn) {
-    case 0:  // stack high-water: 0x1xxxxxxx, low 24 bits = the deepest address touched
-        *REPORT_ADDR = 0x10000000u | (deepest & 0x00FFFFFFu);
-        break;
-    case 1:  // f_CLK as the firmware itself believes it: 0x2 + Hz/16 (fits 28 bits up to 4 GHz)
-        *REPORT_ADDR = 0x20000000u | ((*FCLK_ADDR >> 4) & 0x0FFFFFFFu);
-        break;
-    case 2:  // live group-A SAU: 0x3 | SDR<<8 | prescaler nibble
-        *REPORT_ADDR = 0x30000000u | ((u32)(*SAU_A_SDR) << 8) | ((*SAU_A_SMR) & 0x000Fu);
-        break;
-    default: // raw f_CLK low 28 bits, to cross-check case 1 without the shift
-        *REPORT_ADDR = 0x40000000u | (*FCLK_ADDR & 0x0FFFFFFFu);
-        break;
-    }
+    // if/else, NOT a switch: an 8-case switch makes GCC emit a jump table calling
+    // __gnu_thumb1_case_sqi, a libgcc helper that does not exist in this freestanding
+    // -nostdlib link (same class of trap as the __aeabi_uidiv one div10() exists to avoid).
+    if (turn == 0) return 0x10000000u | (deepest & 0x00FFFFFFu);      // stack high-water
+    if (turn == 1) return 0x20000000u | ((*FCLK_ADDR >> 4) & 0x0FFFFFFFu);  // f_CLK / 16
+    if (turn == 2) return 0x30000000u | ((u32)(*SAU_A_SDR) << 8) | ((*SAU_A_SMR) & 0x000Fu);
+    if (turn == 3) return 0x40000000u | (*FCLK_ADDR & 0x0FFFFFFFu);   // f_CLK raw
+    if (turn == 4) return 0x50000000u | ((u32)(*SAU_B_SDR) << 8) | ((*SAU_B_SMR) & 0x000Fu);
+    if (turn == 5) return 0x60000000u | ((u32)(*SAU_A_SDR1) << 8);    // group-A RX channel
+    if (turn == 6) return 0x70000000u | ((u32)(*SAU_B_SDR1) << 8);    // group-B second channel
+    return 0x10000000u | (deepest & 0x00FFFFFFu);                     // repeat, easy to confirm
 }
+
+// ---- entry points ----------------------------------------------------------------------------
+// v99, decode site 0xC0EA: writes the import field directly. SUPERSEDED -- the vendor's report
+// builder sub_77B4 rewrites import (+0) on every telegram, so this sentinel never reached the
+// gateway. Kept so the v99 image remains reproducible.
+void canary_probe(void) { u32 v = probe_core(); if (v) *REPORT_ADDR = v; }
+
+// v100, report site 0x7800 inside sub_77B4: RETURNS the diagnostic so it becomes the stored power
+// value, making us the last writer. power_in is the reader's real power, passed through only when
+// the probe has nothing to say.
+u32 canary_probe_report(u32 power_in) { u32 v = probe_core(); return v ? v : power_in; }
 
 // ---- how to read the result on the gateway ----------------------------------------------------
 //   0x00C0FFEE     -> painted, waiting for a read session to happen
