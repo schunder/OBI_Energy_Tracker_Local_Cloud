@@ -25,7 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "reader_stock_v57.bin"
-DST = HERE / "build" / "reader_probe_v102.bin"
+DST = HERE / "build" / "reader_probe_v103.bin"
 BLOB = HERE / "build" / "probe.bin"
 SYMS = HERE / "build" / "probe.sym"
 BASE = 0x4000
@@ -44,7 +44,7 @@ ENTRY = "entry_probe_report"
 
 # softver: 91 canary, 92..98 the armed attempts, 99 = this probe. Must differ from the
 # reader's current version or the gateway treats the OTA as a no-op. 99 = v99 probe, 100 = this.
-SOFTVER = 102
+SOFTVER = 103
 SOFTVER_OFFSETS = (0x8B36, 0x8B80)
 
 

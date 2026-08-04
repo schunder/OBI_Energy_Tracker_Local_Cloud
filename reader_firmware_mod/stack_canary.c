@@ -31,9 +31,8 @@ typedef unsigned int   u32;
 // from there, so "deeper" means a LOWER address.
 #define STACK_TOP        0x200016b0u
 
-// Paint from here upward. 0x20001000..0x20001010 is atc1441's hook state (PREV_MAGIC / PREV_IMP /
-// PREV_EXP / STATE_DIR / STATE_AGE) -- must not be clobbered, so start above it.
-#define PAINT_LO         0x20001020u
+// Paint from here upward; see the v103 note below -- the RAM stub lives under this line.
+#define PAINT_LO         0x20001060u
 
 // Leave this much headroom below our own SP unpainted: we must not paint the frame we are
 // standing in, nor the few words the return path will touch.
@@ -78,6 +77,25 @@ typedef unsigned int   u32;
 // Before considering any write there we must know what ELSE is in 0xEE08..0xF4C8. If it is all
 // erased (0xFF) then extending the OTA image to reach the record is safe; if it holds data, it
 // may be pairing/calibration/identity and overwriting it would not be canary-recoverable.
+// ---- v103: RAM-resident RX collector -------------------------------------------------------
+// The group-B RX callback is invoked from the ISR *during the optical read session* -- the phase
+// where branching into the appended blob at 0xEE08 faults (v92..v98). A flash-resident collector
+// would reproduce that crash, so the collector must live in RAM. The vendor's own handler at
+// 0x635E already does `blx` through this pointer in that phase, so RAM execution there is proven
+// by construction.
+//
+// Hand-assembled Thumb-1, 24 bytes, PC-relative literals so it runs at any 4-aligned address:
+//   push {r4,lr}; ldr r4,[pc,#12]; ldr r1,[r4]; adds r1,#1; str r1,[r4]
+//   ldr r4,[pc,#8]; blx r4; pop {r4,pc}      ; +0x10 = &counter, +0x14 = original callback
+// It counts one byte and then CHAINS to the vendor collector, so SML reception is untouched.
+#define STUB_ADDR        0x20001020u                     // 24 B, below PAINT_LO
+#define STUB_COUNT       ((volatile u32 *)0x20001040u)   // bytes seen by our collector
+#define STUB_ORIG        ((volatile u32 *)0x20001044u)   // saved vendor callback
+#define STUB_STATE       ((volatile u32 *)0x20001048u)   // 0 none, 1 installed, 2 refused
+#define SAU_B_CB         ((volatile u32 *)0x20000074u)   // group-B RX callback ptr (struct+4)
+// NOTE for the real hook later: kmp_hook.c puts KMP_BUF at 0x20001040, which collides with
+// STUB_COUNT. Move one of them before the two ever coexist.
+
 #define CFG_REC          ((volatile u32 *)0x0000F4C8u)   // [+0] baud
 #define CFG_REC2         ((volatile u32 *)0x0000F4CCu)   // [+4] flags/framing
 #define GAP_LO           0x0000EE08u                     // first byte past the app image
@@ -90,6 +108,47 @@ typedef unsigned int   u32;
 // lands in the power field (+8) as the last writer. Values stay < 0x80000000 so the signed power
 // field shows them as positive.
 u32 canary_probe_report(u32 power_in);
+
+// Install the RAM collector once. Chains rather than replaces, and refuses if the vendor has no
+// callback installed (blx 0 would fault).
+static void install_rx_stub(void)
+{
+    if (*STUB_STATE != 0u) return;                 // already decided
+    u32 orig = *SAU_B_CB;
+    if (orig == 0u || orig == (STUB_ADDR | 1u)) { *STUB_STATE = 2u; return; }
+
+    volatile u16 *c = (volatile u16 *)STUB_ADDR;
+    c[0] = 0xB510u;  // push {r4, lr}
+    c[1] = 0x4C03u;  // ldr  r4,[pc,#12]  -> &counter
+    c[2] = 0x6821u;  // ldr  r1,[r4]
+    c[3] = 0x1C49u;  // adds r1,r1,#1
+    c[4] = 0x6021u;  // str  r1,[r4]
+    c[5] = 0x4C02u;  // ldr  r4,[pc,#8]   -> original callback
+    c[6] = 0x47A0u;  // blx  r4
+    c[7] = 0xBD10u;  // pop  {r4, pc}
+    *(volatile u32 *)(STUB_ADDR + 0x10u) = (u32)(unsigned long)STUB_COUNT;
+    *(volatile u32 *)(STUB_ADDR + 0x14u) = orig;
+
+    *STUB_COUNT = 0u;
+    *STUB_ORIG  = orig;
+    *SAU_B_CB   = STUB_ADDR | 1u;                  // thumb bit
+    *STUB_STATE = 1u;
+}
+
+// Prove the group-B prescaler is writable WITHOUT leaving the port misconfigured: write 8, read
+// back, restore 5 immediately. Never leaves 1200 baud active, so SML reception cannot break and we
+// cannot lock ourselves out (a broken SML stream means no decode phase, hence no more hook calls,
+// hence no way to restore -- recoverable only by reflashing the canary).
+static u32 prescaler_write_test(void)
+{
+    volatile u16 *smr = SAU_B_SMR;
+    u16 before = (u16)(*smr & 0x000Fu);
+    *smr = (u16)((*smr & ~0x000Fu) | 8u);
+    u16 after  = (u16)(*smr & 0x000Fu);
+    *smr = (u16)((*smr & ~0x000Fu) | before);      // restore immediately
+    u16 back   = (u16)(*smr & 0x000Fu);
+    return ((u32)before << 8) | ((u32)after << 4) | back;   // expect 0x585
+}
 
 static inline u32 read_sp(void)
 {
@@ -112,6 +171,8 @@ static u32 probe_core(void)
         // ---- first call: paint, and report a recognisable "armed" value ----
         for (u32 a = PAINT_LO; a < hi; a += 4) *(volatile u32 *)a = PATTERN;
         *MAGIC_ADDR = MAGIC_VAL;
+        *STUB_STATE = 0u;
+        install_rx_stub();                      // v103: RAM collector, chained (see above)
         return 0x00C0FFEEu;                     // armed sentinel
     }
 
@@ -125,39 +186,28 @@ static u32 probe_core(void)
 
     // One u32 of report per cycle, so rotate through the things worth knowing. The top nibble is
     // an item tag; the gateway just prints the raw value and you decode by tag.
-    u32 turn = (*TURN_ADDR) & 15u;
+    u32 turn = (*TURN_ADDR) & 15u;   // 11 used, rest repeat the stack mark
     *TURN_ADDR = turn + 1u;
 
-    // if/else, NOT a switch: an 8-case switch makes GCC emit a jump table calling
-    // __gnu_thumb1_case_sqi, a libgcc helper that does not exist in this freestanding
-    // -nostdlib link (same class of trap as the __aeabi_uidiv one div10() exists to avoid).
-    // -fno-jump-tables in build_probe.sh is what actually holds this; GCC rewrites the chain
-    // back into a table without it.
+    // if/else, NOT a switch: GCC emits a Thumb-1 jump table calling __gnu_thumb1_case_uqi,
+    // a libgcc helper absent from this freestanding -nostdlib link. -fno-jump-tables in
+    // build_probe.sh is what actually holds this; GCC rewrites the chain back into a table
+    // without it.
+    install_rx_stub();                                                // retry if it was refused
+
     if (turn == 0) return 0x10000000u | (deepest & 0x00FFFFFFu);      // stack high-water
     if (turn == 1) return 0x20000000u | ((*FCLK_ADDR >> 4) & 0x0FFFFFFFu);  // f_CLK / 16
     if (turn == 2) return 0x30000000u | ((u32)(*SAU_A_SDR) << 8) | ((*SAU_A_SMR) & 0x000Fu);
-    if (turn == 3) return 0x40000000u | (*FCLK_ADDR & 0x0FFFFFFFu);   // f_CLK raw
-    if (turn == 4) return 0x50000000u | ((u32)(*SAU_B_SDR) << 8) | ((*SAU_B_SMR) & 0x000Fu);
-    if (turn == 5) return 0x60000000u | ((u32)(*SAU_A_SDR1) << 8);    // group-A RX channel
-    if (turn == 6) return 0x70000000u | ((u32)(*SAU_B_SDR1) << 8);    // group-B second channel
+    if (turn == 3) return 0x50000000u | ((u32)(*SAU_B_SDR) << 8) | ((*SAU_B_SMR) & 0x000Fu);
+    if (turn == 4) return 0x70000000u | ((u32)(*SAU_B_SDR1) << 8);    // group-B live RX byte
+    if (turn == 5) return 0x80000000u | (*CFG_REC & 0x0FFFFFFFu);     // meter baud @0xF4C8
 
-    // ---- v102: the meter UART config record + a survey of the region it sits in ----
-    if (turn == 7) return 0x80000000u | (*CFG_REC  & 0x0FFFFFFFu);    // METER BAUD (expect 9600)
-    if (turn == 8) return 0x90000000u | (*CFG_REC2 & 0x0FFFFFFFu);    // framing word
-
-    if (turn >= 9 && turn <= 11) {
-        // one pass over the gap between the app image and the record
-        u32 nonff = 0, first = 0, last = 0;
-        for (u32 a = GAP_LO; a < GAP_HI; a++) {
-            u8 v = *(volatile u8 *)a;
-            if (v != 0xFFu) { nonff++; if (!first) first = a; last = a; }
-        }
-        if (turn ==  9) return 0xA0000000u | (nonff & 0x0FFFFFFFu);   // how much data is in the gap
-        if (turn == 10) return 0xB0000000u | (first & 0x0FFFFFFFu);   // where it starts (0 = erased)
-        return 0xC0000000u | (last & 0x0FFFFFFFu);                    // where it ends
-    }
-    if (turn == 12) return 0xD0000000u | (*(volatile u32 *)0x0000F4D0u & 0x0FFFFFFFu); // after record
-    if (turn == 13) return 0xE0000000u | (*(volatile u32 *)0x0000EE08u & 0x0FFFFFFFu); // gap start
+    // ---- v103 ----
+    if (turn == 6) return 0x90000000u | (prescaler_write_test() & 0x0FFFFFFFu);
+    if (turn == 7) return 0xA0000000u | (*STUB_COUNT & 0x0FFFFFFFu);  // bytes our collector saw
+    if (turn == 8) return 0xB0000000u | (*STUB_ORIG  & 0x0FFFFFFFu);  // the vendor callback we chain
+    if (turn == 9) return 0xC0000000u | (*STUB_STATE & 0x0FFFFFFFu);  // 0 none / 1 installed / 2 refused
+    if (turn == 10) return 0xD0000000u | (*SAU_B_CB  & 0x0FFFFFFFu);  // what the slot holds NOW
     return 0x10000000u | (deepest & 0x00FFFFFFu);                     // repeat stack
 }
 
