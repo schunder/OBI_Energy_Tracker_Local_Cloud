@@ -93,6 +93,23 @@ typedef unsigned int   u32;
 #define STUB_ORIG        ((volatile u32 *)0x20001044u)   // saved vendor callback
 #define STUB_STATE       ((volatile u32 *)0x20001048u)   // 0 none, 1 installed, 2 refused
 #define SAU_B_CB         ((volatile u32 *)0x20000074u)   // group-B RX callback ptr (struct+4)
+
+// ---- v104: does the read session re-apply the group-B config every wake? --------------------
+// This decides the whole KMP firmware shape. If the config IS re-applied from the 0xF4C8 record
+// each wake, a register-level retune survives only one cycle and the entire
+// retune -> TX -> reply -> restore transaction must fit inside a single window.
+//
+// The test is ASYMMETRIC and that is unavoidable:
+//   - reverted to 5  -> a normal report carries the answer (config IS re-applied)
+//   - stayed at 8    -> CANNOT report. 1200 baud breaks SML decode, sub_77B4 stops being called,
+//                       the hook never runs again, and the prescaler cannot be restored.
+//                       Silence IS the answer, and recovery is a canary reflash.
+// So it arms exactly once, late (after two full rotations have re-confirmed the baseline in this
+// build), and the very first thing the next invocation does is read the prescaler and restore 5.
+#define PTEST_STATE      ((volatile u32 *)0x2000104Cu)   // 0 idle, 1 armed, 2 done
+#define PTEST_RESULT     ((volatile u32 *)0x20001050u)   // prescaler as found on the next call
+#define PTEST_CALLS      ((volatile u32 *)0x20001054u)   // monotonic call count (TURN_ADDR wraps at 16)
+#define PTEST_ARM_AFTER  32u                             // calls before arming (~2 full rotations)
 // NOTE for the real hook later: kmp_hook.c puts KMP_BUF at 0x20001040, which collides with
 // STUB_COUNT. Move one of them before the two ever coexist.
 
@@ -161,6 +178,15 @@ static inline u32 read_sp(void)
 // mark. 0 while still painting or if nothing was touched.
 static u32 probe_core(void)
 {
+    // FIRST thing, before the write test or anything else can disturb the register: if the
+    // persistence test was armed on the previous call, read what the prescaler is NOW and put it
+    // straight back to 5. Reaching this line at all already means SML kept decoding.
+    if (*PTEST_STATE == 1u) {
+        *PTEST_RESULT = (u32)(*SAU_B_SMR & 0x000Fu);
+        *SAU_B_SMR = (u16)((*SAU_B_SMR & ~0x000Fu) | 5u);
+        *PTEST_STATE = 2u;
+    }
+
     u32 sp = read_sp();
     u32 hi = sp - SP_MARGIN;
     hi &= ~3u;
@@ -172,6 +198,9 @@ static u32 probe_core(void)
         for (u32 a = PAINT_LO; a < hi; a += 4) *(volatile u32 *)a = PATTERN;
         *MAGIC_ADDR = MAGIC_VAL;
         *STUB_STATE = 0u;
+        *PTEST_STATE = 0u;
+        *PTEST_RESULT = 0u;
+        *PTEST_CALLS = 0u;
         install_rx_stub();                      // v103: RAM collector, chained (see above)
         return 0x00C0FFEEu;                     // armed sentinel
     }
@@ -188,6 +217,7 @@ static u32 probe_core(void)
     // an item tag; the gateway just prints the raw value and you decode by tag.
     u32 turn = (*TURN_ADDR) & 15u;   // 11 used, rest repeat the stack mark
     *TURN_ADDR = turn + 1u;
+    *PTEST_CALLS = *PTEST_CALLS + 1u;   // TURN_ADDR wraps at 16, so count calls separately
 
     // if/else, NOT a switch: GCC emits a Thumb-1 jump table calling __gnu_thumb1_case_uqi,
     // a libgcc helper absent from this freestanding -nostdlib link. -fno-jump-tables in
@@ -208,6 +238,15 @@ static u32 probe_core(void)
     if (turn == 8) return 0xB0000000u | (*STUB_ORIG  & 0x0FFFFFFFu);  // the vendor callback we chain
     if (turn == 9) return 0xC0000000u | (*STUB_STATE & 0x0FFFFFFFu);  // 0 none / 1 installed / 2 refused
     if (turn == 10) return 0xD0000000u | (*SAU_B_CB  & 0x0FFFFFFFu);  // what the slot holds NOW
+    if (turn == 11) return 0xE0000000u | (*PTEST_STATE & 0x0FFFFFFFu);   // 0 idle 1 armed 2 done
+    if (turn == 12) return 0xF0000000u | (*PTEST_RESULT & 0x0FFFFFFFu);  // THE ANSWER: 5 or 8
+
+    // Arm once, late: leave the port at 1200 and let the next wake decide.
+    if (turn == 13 && *PTEST_STATE == 0u && *PTEST_CALLS > PTEST_ARM_AFTER) {
+        *SAU_B_SMR = (u16)((*SAU_B_SMR & ~0x000Fu) | 8u);
+        *PTEST_STATE = 1u;
+        return 0x0ABCDEF0u;                                           // "test armed" marker
+    }
     return 0x10000000u | (deepest & 0x00FFFFFFu);                     // repeat stack
 }
 
