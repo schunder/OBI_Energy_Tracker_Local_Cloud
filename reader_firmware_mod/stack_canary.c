@@ -66,6 +66,23 @@ typedef unsigned int   u32;
 #define SAU_B_SDR        ((volatile u16 *)0x40041748u)
 #define SAU_B_SDR1       ((volatile u16 *)0x4004174Au)
 
+// ---- v102: the METER UART's config record, and the region it lives in ------------------------
+// The read session does `ldr r0,=0xF4C8 ; ldmia r0!,{r0,r1}` at 0x59F2 and hands those 8 bytes to
+// the group-B (meter) setup at 0x59FC. So the meter's baud is a DATA RECORD, layout
+// {u32 baud @+0, u8, u8, u8 framing @+6, u8} -- the same shape as the 0xECC8 profile records.
+//
+// 0xF4C8 is PAST the end of the app image (0xEE08), i.e. in a persistent config area that the
+// OTA payload does not cover. That is both why the 0xECC8 table has no xrefs (it is a template)
+// and why no baud constant appears anywhere in code.
+//
+// Before considering any write there we must know what ELSE is in 0xEE08..0xF4C8. If it is all
+// erased (0xFF) then extending the OTA image to reach the record is safe; if it holds data, it
+// may be pairing/calibration/identity and overwriting it would not be canary-recoverable.
+#define CFG_REC          ((volatile u32 *)0x0000F4C8u)   // [+0] baud
+#define CFG_REC2         ((volatile u32 *)0x0000F4CCu)   // [+4] flags/framing
+#define GAP_LO           0x0000EE08u                     // first byte past the app image
+#define GAP_HI           0x0000F4C8u                     // the record itself
+
 // v100: the report-builder entry point. canary_probe() below writes 0x20000D68 (= import at +0),
 // which the vendor report builder sub_77B4 OVERWRITES on every telegram -- so its sentinel can
 // never reach the gateway. This variant is spliced at 0x7800 inside sub_77B4 instead, the path
@@ -108,12 +125,14 @@ static u32 probe_core(void)
 
     // One u32 of report per cycle, so rotate through the things worth knowing. The top nibble is
     // an item tag; the gateway just prints the raw value and you decode by tag.
-    u32 turn = (*TURN_ADDR) & 7u;
+    u32 turn = (*TURN_ADDR) & 15u;
     *TURN_ADDR = turn + 1u;
 
     // if/else, NOT a switch: an 8-case switch makes GCC emit a jump table calling
     // __gnu_thumb1_case_sqi, a libgcc helper that does not exist in this freestanding
     // -nostdlib link (same class of trap as the __aeabi_uidiv one div10() exists to avoid).
+    // -fno-jump-tables in build_probe.sh is what actually holds this; GCC rewrites the chain
+    // back into a table without it.
     if (turn == 0) return 0x10000000u | (deepest & 0x00FFFFFFu);      // stack high-water
     if (turn == 1) return 0x20000000u | ((*FCLK_ADDR >> 4) & 0x0FFFFFFFu);  // f_CLK / 16
     if (turn == 2) return 0x30000000u | ((u32)(*SAU_A_SDR) << 8) | ((*SAU_A_SMR) & 0x000Fu);
@@ -121,7 +140,25 @@ static u32 probe_core(void)
     if (turn == 4) return 0x50000000u | ((u32)(*SAU_B_SDR) << 8) | ((*SAU_B_SMR) & 0x000Fu);
     if (turn == 5) return 0x60000000u | ((u32)(*SAU_A_SDR1) << 8);    // group-A RX channel
     if (turn == 6) return 0x70000000u | ((u32)(*SAU_B_SDR1) << 8);    // group-B second channel
-    return 0x10000000u | (deepest & 0x00FFFFFFu);                     // repeat, easy to confirm
+
+    // ---- v102: the meter UART config record + a survey of the region it sits in ----
+    if (turn == 7) return 0x80000000u | (*CFG_REC  & 0x0FFFFFFFu);    // METER BAUD (expect 9600)
+    if (turn == 8) return 0x90000000u | (*CFG_REC2 & 0x0FFFFFFFu);    // framing word
+
+    if (turn >= 9 && turn <= 11) {
+        // one pass over the gap between the app image and the record
+        u32 nonff = 0, first = 0, last = 0;
+        for (u32 a = GAP_LO; a < GAP_HI; a++) {
+            u8 v = *(volatile u8 *)a;
+            if (v != 0xFFu) { nonff++; if (!first) first = a; last = a; }
+        }
+        if (turn ==  9) return 0xA0000000u | (nonff & 0x0FFFFFFFu);   // how much data is in the gap
+        if (turn == 10) return 0xB0000000u | (first & 0x0FFFFFFFu);   // where it starts (0 = erased)
+        return 0xC0000000u | (last & 0x0FFFFFFFu);                    // where it ends
+    }
+    if (turn == 12) return 0xD0000000u | (*(volatile u32 *)0x0000F4D0u & 0x0FFFFFFFu); // after record
+    if (turn == 13) return 0xE0000000u | (*(volatile u32 *)0x0000EE08u & 0x0FFFFFFFu); // gap start
+    return 0x10000000u | (deepest & 0x00FFFFFFu);                     // repeat stack
 }
 
 // ---- entry points ----------------------------------------------------------------------------
