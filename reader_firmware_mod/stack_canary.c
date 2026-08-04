@@ -32,7 +32,7 @@ typedef unsigned int   u32;
 #define STACK_TOP        0x200016b0u
 
 // Paint from here upward; see the v103 note below -- the RAM stub lives under this line.
-#define PAINT_LO         0x20001060u
+#define PAINT_LO         0x200010C0u
 
 // Leave this much headroom below our own SP unpainted: we must not paint the frame we are
 // standing in, nor the few words the return path will touch.
@@ -88,10 +88,15 @@ typedef unsigned int   u32;
 //   push {r4,lr}; ldr r4,[pc,#12]; ldr r1,[r4]; adds r1,#1; str r1,[r4]
 //   ldr r4,[pc,#8]; blx r4; pop {r4,pc}      ; +0x10 = &counter, +0x14 = original callback
 // It counts one byte and then CHAINS to the vendor collector, so SML reception is untouched.
-#define STUB_ADDR        0x20001020u                     // 24 B, below PAINT_LO
-#define STUB_COUNT       ((volatile u32 *)0x20001040u)   // bytes seen by our collector
-#define STUB_ORIG        ((volatile u32 *)0x20001044u)   // saved vendor callback
-#define STUB_STATE       ((volatile u32 *)0x20001048u)   // 0 none, 1 installed, 2 refused
+#define STUB_ADDR        0x20001020u                     // 44 B (v109), below PAINT_LO
+#define STUB_COUNT       ((volatile u32 *)0x20001050u)   // bytes seen by our collector
+#define STUB_ORIG        ((volatile u32 *)0x20001054u)   // saved vendor callback
+#define STUB_STATE       ((volatile u32 *)0x20001058u)   // 0 none, 1 installed, 2 refused
+// v109: a byte COUNT cannot tell a KMP reply from our own echo or from 1200-baud mis-framing of
+// ambient light. So capture the bytes themselves into a 64-byte ring and ship them out four at a
+// time. This is the difference between "2831 somethings arrived" and "40 3F 10 00 44 ...".
+#define STUB_BUF         0x20001060u                     // 64-byte capture ring
+#define STUB_BUF_LEN     64u
 #define SAU_B_CB         ((volatile u32 *)0x20000074u)   // group-B RX callback ptr (struct+4)
 
 // ---- v104: does the read session re-apply the group-B config every wake? --------------------
@@ -108,7 +113,7 @@ typedef unsigned int   u32;
 // build), and the very first thing the next invocation does is read the prescaler and restore 5.
 #define PTEST_STATE      ((volatile u32 *)0x2000104Cu)   // 0 idle, 1 armed, 2 done
 #define PTEST_RESULT     ((volatile u32 *)0x20001050u)   // prescaler as found on the next call
-#define PTEST_CALLS      ((volatile u32 *)0x20001054u)   // monotonic call count (TURN_ADDR wraps at 16)
+#define PTEST_CALLS      ((volatile u32 *)0x2000105Cu)   // monotonic call count (TURN_ADDR wraps at 16)
 #define PTEST_ARM_AFTER  32u                             // calls before arming (~2 full rotations)
 // NOTE for the real hook later: kmp_hook.c puts KMP_BUF at 0x20001040, which collides with
 // STUB_COUNT. Move one of them before the two ever coexist.
@@ -135,16 +140,23 @@ static void install_rx_stub(void)
     if (orig == 0u || orig == (STUB_ADDR | 1u)) { *STUB_STATE = 2u; return; }
 
     volatile u16 *c = (volatile u16 *)STUB_ADDR;
-    c[0] = 0xB510u;  // push {r4, lr}
-    c[1] = 0x4C03u;  // ldr  r4,[pc,#12]  -> &counter
-    c[2] = 0x6821u;  // ldr  r1,[r4]
-    c[3] = 0x1C49u;  // adds r1,r1,#1
-    c[4] = 0x6021u;  // str  r1,[r4]
-    c[5] = 0x4C02u;  // ldr  r4,[pc,#8]   -> original callback
-    c[6] = 0x47A0u;  // blx  r4
-    c[7] = 0xBD10u;  // pop  {r4, pc}
-    *(volatile u32 *)(STUB_ADDR + 0x10u) = (u32)(unsigned long)STUB_COUNT;
-    *(volatile u32 *)(STUB_ADDR + 0x14u) = orig;
+    c[0]  = 0xB510u; // push {r4, lr}
+    c[1]  = 0x4C07u; // ldr  r4,[pc,#28] -> &counter
+    c[2]  = 0x6821u; // ldr  r1,[r4]
+    c[3]  = 0x1C49u; // adds r1,r1,#1
+    c[4]  = 0x6021u; // str  r1,[r4]
+    c[5]  = 0x1E49u; // subs r1,r1,#1     ; index = count-1
+    c[6]  = 0x223Fu; // movs r2,#63
+    c[7]  = 0x4011u; // ands r1,r2        ; wrap into the ring
+    c[8]  = 0x4C04u; // ldr  r4,[pc,#16] -> &buffer
+    c[9]  = 0x5460u; // strb r0,[r4,r1]   ; CAPTURE the byte
+    c[10] = 0x4C04u; // ldr  r4,[pc,#16] -> original callback
+    c[11] = 0x47A0u; // blx  r4           ; chain to the vendor collector
+    c[12] = 0xBD10u; // pop  {r4, pc}
+    c[13] = 0x0000u; // pad to the literal pool
+    *(volatile u32 *)(STUB_ADDR + 0x20u) = (u32)(unsigned long)STUB_COUNT;
+    *(volatile u32 *)(STUB_ADDR + 0x24u) = STUB_BUF;
+    *(volatile u32 *)(STUB_ADDR + 0x28u) = orig;
 
     *STUB_COUNT = 0u;
     *STUB_ORIG  = orig;
@@ -260,6 +272,121 @@ void canary_probe(void) { u32 v = probe_core(); if (v) *REPORT_ADDR = v; }
 // value, making us the last writer. power_in is the reader's real power, passed through only when
 // the probe has nothing to say.
 u32 canary_probe_report(u32 power_in) { u32 v = probe_core(); return v ? v : power_in; }
+
+// v105, status site 0xCB4A: the ONLY channel that works on a meter that pushes nothing. The
+// Kamstrup sends no SML, so sub_77B4 never runs and the 0x7800 report site is dead code -- but the
+// cmd-35 status packet is still built every wake. We commandeer its BATTERY byte.
+//
+// Only 8 bits per ~25 s, so the payload is a small rotating summary. The bridge reports
+// battery_mV = 20 * byte, so read the byte back as battery_mV / 20.
+//   0xA5        -> marker: our hook is executing on this meter
+//   0xB0 | pre  -> group-B prescaler (0xB5 = 9600, 0xB8 = 1200)
+//   0x00..0xFF  -> RX bytes >> 8 (coarse count; stays 0 on a meter that pushes nothing)
+//   0xC0 | st   -> RAM stub state (0xC1 = installed)
+//   0xD0 | n    -> heartbeat, so a frozen channel is visible
+// v106: the cmd-37 energy builder reads its import/export/power from HERE, not 0x20000D68.
+#define PKT_IMPORT       ((volatile u32 *)0x20000DDCu)
+#define PKT_EXPORT       ((volatile u32 *)0x20000DE0u)
+#define PKT_POWER        ((volatile u32 *)0x20000DE4u)
+
+// v106, hooked at 0xCB8A inside the cmd-37 builder: runs EVERY wake regardless of meter data, and
+// writes three 32-bit diagnostics straight into the packet the reader is about to send. Read them
+// on the bridge at /api/radio -> "di" as imp / exp / pow.
+//   import = 0xC0FFEE00 | rotating tag   (proof the hook runs + which slot)
+//   export = tag-dependent payload
+//   power  = RX bytes our RAM collector has seen (0 until something transmits)
+// v107: the no-data path's sentinel replacement. Returns what import/export/power will carry.
+// One 32-bit word per wake, rotating -- and unlike every earlier channel this one runs on a meter
+// that transmits nothing, which is the whole point.
+// ---- v108: the actual KMP transaction --------------------------------------------------------
+// Group-B TX is a single-byte writer at 0x5F64 (strb r0,[0x40041748]). The query is pre-stuffed
+// with its CRC and stop byte, so it can be clocked out as-is.
+//   80 3F 10 01 00 44 4D C0 0D  = GetRegister(0x0044 = V1 volume, m3)
+// v110: bring the optical port UP ourselves instead of assuming it is already on.
+// v109 fired the query from the report phase and captured NOTHING -- not even our own echo off the
+// eye glass -- which says the port is powered down outside the read session, so a prescaler poke
+// was writing to a dead peripheral.
+//
+// The vendor's own group-B init is callable:  0xDBA0(r0 = 8-byte config record, r1 = f_CLK)
+// (prologue `mov r4,r0`; it takes baud from [r4+0] and framing from [r4+6], and f_CLK from the
+// saved r1). So copy the live record from 0xF4C8, drop the baud word to 1200, and let the vendor
+// do the full bring-up -- clocks, port enable, framing -- exactly as it does each wake.
+// No restore needed: the next read session re-applies 9600 from 0xF4C8 (proved by v104).
+typedef void (*uart_init_fn)(const volatile u32 *cfg, u32 fclk);
+#define VENDOR_B_INIT ((uart_init_fn)(0xDBA0u | 1u))
+#define KMP_CFG       ((volatile u32 *)0x200010A0u)   // our 8-byte config record, below PAINT_LO
+
+typedef void (*kmp_tx_fn)(u8 b);
+#define KMP_TX_BYTE   ((kmp_tx_fn)(0x5F64u | 1u))
+static const u8 kmp_query[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
+
+// Retune group B 9600 -> 1200 (prescaler 5 -> 8, same divisor 103) and clock the query out.
+// No restore: the read session re-applies 9600 from the 0xF4C8 record on the next wake, which
+// v104 proved. The reply, if any, is gathered by the RAM collector and shows up as STUB_COUNT.
+static void kmp_fire(void)
+{
+    KMP_CFG[0] = 1200u;          // baud  (live record holds 9600)
+    KMP_CFG[1] = CFG_REC[1];     // keep the vendor's framing/flags word verbatim (0x00000101)
+    VENDOR_B_INIT(KMP_CFG, *FCLK_ADDR);
+    for (u32 i = 0; i < sizeof kmp_query; i++) KMP_TX_BYTE(kmp_query[i]);
+}
+
+u32 canary_probe_nodata(void)
+{
+    install_rx_stub();
+    *PTEST_CALLS = *PTEST_CALLS + 1u;
+    u32 t = (*TURN_ADDR) & 15u;
+    *TURN_ADDR = t + 1u;
+
+    // Slot 3 fires the query and CLEARS the ring, so slots 4..15 dump exactly what came back in
+    // response rather than whatever was already sitting there.
+    if (t == 3 && *STUB_STATE == 1u) {
+        for (u32 i = 0; i < STUB_BUF_LEN; i++) *(volatile u8 *)(STUB_BUF + i) = 0;
+        *STUB_COUNT = 0u;
+        kmp_fire();
+    }
+
+    if (t == 0) return 0xC0FFEE00u | (u32)(*SAU_B_SMR & 0x000Fu);   // marker + live prescaler
+    if (t == 1) return *STUB_COUNT;                                  // how many bytes came back
+    if (t == 2) return 0x57AB0000u | (*STUB_STATE & 0xFu) | ((*STUB_COUNT & 0xFFFu) << 8);
+    if (t == 3) return 0xBEA70000u | (*PTEST_CALLS & 0xFFFFu);       // heartbeat; query just fired
+    if (t == 4) return KMP_CFG[0];                                   // baud we asked the vendor for
+    if (t == 5) return 0xC0FFEE00u | (u32)(*SAU_B_SMR & 0x000Fu);    // prescaler AFTER the init
+
+    // slots 6..15 -> ring bytes 0..39, packed big-endian so the hex reads left-to-right
+    u32 k = (t - 6u) * 4u;
+    const volatile u8 *b = (const volatile u8 *)STUB_BUF;
+    return ((u32)b[k] << 24) | ((u32)b[k+1] << 16) | ((u32)b[k+2] << 8) | (u32)b[k+3];
+}
+
+void canary_probe_energy(void)
+{
+    install_rx_stub();
+    *PTEST_CALLS = *PTEST_CALLS + 1u;
+    u32 t = (*TURN_ADDR) & 3u;
+    *TURN_ADDR = t + 1u;
+
+    *PKT_IMPORT = 0xC0FFEE00u | t;
+    if      (t == 0) *PKT_EXPORT = 0x5A0F0000u | (u32)(*SAU_B_SMR & 0x000Fu);   // group-B prescaler
+    else if (t == 1) *PKT_EXPORT = *FCLK_ADDR;                                   // f_CLK, sanity
+    else if (t == 2) *PKT_EXPORT = 0x57AB0000u | (*STUB_STATE & 0xFu);           // RAM stub state
+    else             *PKT_EXPORT = *PTEST_CALLS;                                 // heartbeat
+    *PKT_POWER = *STUB_COUNT;                                                    // meter bytes seen
+}
+
+u32 canary_probe_batt(u32 batt_in)
+{
+    (void)batt_in;                       // the real battery is sacrificed while we borrow the field
+    install_rx_stub();
+    *PTEST_CALLS = *PTEST_CALLS + 1u;
+    u32 t = (*TURN_ADDR) & 7u;
+    *TURN_ADDR = t + 1u;
+    if (t == 0) return 0xA5u;
+    if (t == 1) return 0xB0u | (u32)(*SAU_B_SMR & 0x000Fu);
+    if (t == 2) return (*STUB_COUNT >> 8) & 0xFFu;
+    if (t == 3) return 0xC0u | (*STUB_STATE & 0x0Fu);
+    return 0xD0u | (*PTEST_CALLS & 0x0Fu);
+}
 
 // ---- how to read the result on the gateway ----------------------------------------------------
 //   0x00C0FFEE     -> painted, waiting for a read session to happen

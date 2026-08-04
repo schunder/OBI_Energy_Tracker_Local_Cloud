@@ -7,11 +7,14 @@ MEMORY
   HOOKS (rx) : ORIGIN = 0xEE08, LENGTH = 0x1000
 }
 
-ENTRY(entry_probe_report)
+ENTRY(entry_probe_nodata)
 
 SECTIONS
 {
   .text : {
+    KEEP(*(.text.entry_probe_nodata))
+    KEEP(*(.text.entry_probe_energy))
+    KEEP(*(.text.entry_probe_batt))
     KEEP(*(.text.entry_probe_report))
     KEEP(*(.text.entry_probe))
     *(.text*)

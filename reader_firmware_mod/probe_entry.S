@@ -45,3 +45,69 @@ entry_probe_report:
     ldr  r1, =obi_report_struct
     adds r1, #8                // replayed: r1 = &power field
     pop  {pc}                  // -> sub_77B4 @0x7804, which stores r0 via sub_43A6
+
+// --- entry_probe_batt ----------------------------------------------------
+// v105. The Kamstrup pushes no SML, so sub_77B4 never runs and the 0x7800 site is dead. But the
+// cmd-35 STATUS packet is still built every wake (that is why softver and battery keep arriving),
+// so we hook its battery store instead and use the battery byte as an 8-bit report channel.
+//
+// Replaces the 4 bytes at 0xCB4A: `add r1,sp,#32 ; strb r0,[r1,#29]`, with R0 holding the battery
+// value (already divided by 20) about to be stored into the packet buffer. We substitute our
+// diagnostic byte and replay the store.
+//
+// sp compensation: `push {lr}` moves sp down 4, so the replayed `add r1,sp,#32` becomes #36.
+.section .text.entry_probe_batt, "ax", %progbits
+.global entry_probe_batt
+.thumb_func
+entry_probe_batt:
+    push {lr}
+    bl   canary_probe_batt   // r0 = real battery byte in -> diagnostic byte out
+    add  r1, sp, #36         // replayed (was sp,#32; +4 for the pushed lr)
+    strb r0, [r1, #29]       // replayed store into the cmd-35 buffer
+    pop  {pc}
+
+// --- entry_probe_energy --------------------------------------------------
+// v106. Replaces the 4-byte `bl 0x4FF4` (battery read) at 0xCB8A, inside the cmd-37 ENERGY packet
+// builder at 0xCB70 -- the packet the reader sends EVERY wake even with no meter data (confirmed
+// on the bridge's /api/radio: c=37, imp/exp/pow = 0x7FFFFFFF sentinels).
+//
+// That builder sources import/export/power from the struct at 0x20000DDC (literal @0xCC7C), NOT
+// the 0x20000D68 that sub_77B4 and atc1441's hooks use. Writing 0x20000D68 is why the v104
+// diagnostics disappeared the moment the reader left the SML meter.
+//
+// 0x4FF4 takes no arguments and returns the raw battery in r0, so running our probe first is safe:
+// it may clobber r0-r3 freely, and 0x4FF4's return value flows on untouched.
+.equ vendor_batt_read, 0x4ff4
+
+.section .text.entry_probe_energy, "ax", %progbits
+.global entry_probe_energy
+.thumb_func
+entry_probe_energy:
+    push {r4, lr}
+    bl   canary_probe_energy      // stuff diagnostics into 0x20000DDC[0/4/8]
+    ldr  r4, =(vendor_batt_read | 1)
+    blx  r4                       // replayed original call; r0 = battery raw
+    pop  {r4, pc}
+
+// --- entry_probe_nodata --------------------------------------------------
+// v107. The cmd-37 builder has TWO paths, selected by a flag byte at [sp+32+14]:
+//   flag==1 -> 0xCBE4, reads real values from the struct at 0x20000DDC
+//   else    -> 0xCBB4, stuffs the CONSTANT 0x7FFFFFFF (literal @0xCC78) into import, export and
+//              power via three sub_43A6 calls
+// With no meter the reader always takes the second path, which is why writing 0x20000DDC (v106)
+// changed nothing. So hook the sentinel load itself.
+//
+// Replaces `ldr r5,[pc,#192] ; mov r0,r5` at 0xCBB6. r5 becomes our diagnostic instead of
+// 0x7FFFFFFF, and since the path reuses r5 for all three fields, import/export/power all carry it.
+//
+// r1 MUST be preserved: it was loaded at 0xCBB4 (the import destination pointer) and is consumed by
+// the `bl 0x43a6` at 0xCBBA, but a C call is free to clobber it. r2/r3 are dead across this window.
+.section .text.entry_probe_nodata, "ax", %progbits
+.global entry_probe_nodata
+.thumb_func
+entry_probe_nodata:
+    push {r1, lr}
+    bl   canary_probe_nodata   // -> r0 = the value to send instead of 0x7FFFFFFF
+    mov  r5, r0                // replayed (was: r5 = literal 0x7FFFFFFF)
+    mov  r0, r5                // replayed
+    pop  {r1, pc}

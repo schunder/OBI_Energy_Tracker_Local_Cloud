@@ -25,7 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "reader_stock_v57.bin"
-DST = HERE / "build" / "reader_probe_v104.bin"
+DST = HERE / "build" / "reader_probe_v110.bin"
 BLOB = HERE / "build" / "probe.bin"
 SYMS = HERE / "build" / "probe.sym"
 BASE = 0x4000
@@ -38,13 +38,22 @@ BASE = 0x4000
 # v99 used the decode site 0xC0EA and wrote 0x20000D68 directly. That address is import at +0,
 # which sub_77B4 rewrites every telegram -- so v99's sentinel was clobbered before transmission
 # and could never have been seen. Not a negative result about the hook; a bug in the readout.
-SITE = 0x7800
-ORIG = bytes([0x06, 0x49, 0x08, 0x31])
-ENTRY = "entry_probe_report"
+# v105: the cmd-35 STATUS packet builder's battery store at 0xCB4A
+# (`add r1,sp,#32 ; strb r0,[r1,#29]`). The 0x7800 report site is dead on a meter that pushes no
+# SML -- sub_77B4 never runs -- but the status packet is built every wake, so this is the only
+# channel that reports on the Kamstrup.
+# v106: `bl 0x4FF4` at 0xCB8A inside the cmd-37 ENERGY builder (0xCB70) -- the packet the reader
+# sends every wake even with no meter (bridge /api/radio shows c=37 with 0x7FFFFFFF sentinels).
+# Its import/export/power come from 0x20000DDC, not the 0x20000D68 that sub_77B4 uses.
+# v107: the sentinel load at 0xCBB6 on the cmd-37 builder's NO-DATA path -- the path actually taken
+# when no meter is attached. Substituting r5 puts our word into import, export AND power.
+SITE = 0xCBB6
+ORIG = bytes([0x30, 0x4D, 0x28, 0x46])
+ENTRY = "entry_probe_nodata"
 
 # softver: 91 canary, 92..98 the armed attempts, 99 = this probe. Must differ from the
 # reader's current version or the gateway treats the OTA as a no-op. 99 = v99 probe, 100 = this.
-SOFTVER = 104
+SOFTVER = 110
 SOFTVER_OFFSETS = (0x8B36, 0x8B80)
 
 
