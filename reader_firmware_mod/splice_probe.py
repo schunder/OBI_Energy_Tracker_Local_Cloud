@@ -25,7 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "reader_stock_v57.bin"
-DST = HERE / "build" / "reader_probe_v114.bin"
+DST = HERE / "build" / "reader_probe_v118.bin"
 BLOB = HERE / "build" / "probe.bin"
 SYMS = HERE / "build" / "probe.sym"
 BASE = 0x4000
@@ -47,13 +47,19 @@ BASE = 0x4000
 # Its import/export/power come from 0x20000DDC, not the 0x20000D68 that sub_77B4 uses.
 # v107: the sentinel load at 0xCBB6 on the cmd-37 builder's NO-DATA path -- the path actually taken
 # when no meter is attached. Substituting r5 puts our word into import, export AND power.
-SITE = 0xCBB6
-ORIG = bytes([0x30, 0x4D, 0x28, 0x46])
-ENTRY = "entry_probe_nodata"
+HOOKS = [
+    # telemetry: the cmd-37 no-data path's sentinel load -> our diagnostic word
+    (0xCBB6, bytes([0x30, 0x4D, 0x28, 0x46]), "entry_probe_nodata"),
+    # v116: the IEC mode-C request setup inside the state machine at 0xD138.
+    #   d1a4: movs r1,#5 ; d1a6: adr r0,0xd2cc ; d1a8: bl 0x9738 (length-counted send)
+    # Replacing the two setup instructions hands the vendor OUR 9-byte KMP frame, so the firmware
+    # transmits it inside its own read session with the optical head powered by its own 0x5BFA.
+    (0xD1A4, bytes([0x05, 0x21, 0x49, 0xA0]), "entry_iec_swap"),
+]
 
 # softver: 91 canary, 92..98 the armed attempts, 99 = this probe. Must differ from the
 # reader's current version or the gateway treats the OTA as a no-op. 99 = v99 probe, 100 = this.
-SOFTVER = 114
+SOFTVER = 118
 SOFTVER_OFFSETS = (0x8B36, 0x8B80)
 
 
@@ -83,15 +89,15 @@ def main():
         m = re.match(r"^([0-9a-fA-F]+)\s+\S+\s+(\S+)", line.strip())
         if m:
             syms[m.group(2)] = int(m.group(1), 16) & ~1
-    target = syms[ENTRY]
-    assert target == 0xEE08, f"{ENTRY} must be the first thing in the blob, got {hex(target)}"
 
-    off = SITE - BASE
-    got = bytes(data[off:off + 4])
-    assert got == ORIG, f"@{hex(SITE)}: expected {ORIG.hex()}, found {got.hex()} -- wrong base file?"
-    patch = bl_encode(SITE, target)
-    data[off:off + 4] = patch
-    print(f"patch @{hex(SITE)}: BL -> {ENTRY}@{hex(target)}  bytes={patch.hex(' ')}")
+    for site, orig, entry in HOOKS:
+        tgt = syms[entry]
+        off = site - BASE
+        got = bytes(data[off:off + 4])
+        assert got == orig, f"@{hex(site)}: expected {orig.hex()}, found {got.hex()} -- wrong base file?"
+        patch = bl_encode(site, tgt)
+        data[off:off + 4] = patch
+        print(f"patch @{hex(site)}: BL -> {entry}@{hex(tgt)}  bytes={patch.hex(' ')}")
 
     for so in SOFTVER_OFFSETS:
         assert data[so] == 0x39 and data[so + 1] == 0x20, f"unexpected softver bytes at {hex(so)}: {data[so:so+2].hex()}"

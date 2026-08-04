@@ -14,11 +14,12 @@ MEMORY
   HOOKS (rx) : ORIGIN = 0xEE08, LENGTH = 0x1000
 }
 
-ENTRY(entry_probe_nodata)
+ENTRY(entry_iec_swap)
 
 SECTIONS
 {
   .text : {
+    KEEP(*(.text.entry_iec_swap))
     KEEP(*(.text.entry_probe_nodata))
     *(.text*)
     *(.rodata*)

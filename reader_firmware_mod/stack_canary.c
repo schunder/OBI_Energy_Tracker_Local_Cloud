@@ -135,9 +135,15 @@ u32 canary_probe_report(u32 power_in);
 // callback installed (blx 0 would fault).
 static void install_rx_stub(void)
 {
-    if (*STUB_STATE != 0u) return;                 // already decided
+    // v118: RE-INSTALL if the slot no longer points at us. The vendor's group-B init (0xDBA0)
+    // reconfigures the SAU and resets this callback, which silently evicted our collector -- v117
+    // captured 0 bytes while still reporting "installed", because the old logic bailed out on
+    // STUB_STATE and never re-checked the slot itself. Trust the hardware, not our own flag.
+    if (*SAU_B_CB == (STUB_ADDR | 1u)) return;     // still ours, nothing to do
+    if (*STUB_STATE == 2u && *SAU_B_CB == 0u) return;  // vendor has no collector; blx 0 would fault
+
     u32 orig = *SAU_B_CB;
-    if (orig == 0u || orig == (STUB_ADDR | 1u)) { *STUB_STATE = 2u; return; }
+    if (orig == 0u) { *STUB_STATE = 2u; return; }
 
     volatile u16 *c = (volatile u16 *)STUB_ADDR;
     c[0]  = 0xB510u; // push {r4, lr}
@@ -158,8 +164,7 @@ static void install_rx_stub(void)
     *(volatile u32 *)(STUB_ADDR + 0x24u) = STUB_BUF;
     *(volatile u32 *)(STUB_ADDR + 0x28u) = orig;
 
-    *STUB_COUNT = 0u;
-    *STUB_ORIG  = orig;
+    *STUB_ORIG  = orig;                            // chain target (do NOT zero the count on re-install)
     *SAU_B_CB   = STUB_ADDR | 1u;                  // thumb bit
     *STUB_STATE = 1u;
 }
@@ -340,11 +345,38 @@ typedef void (*uart_init_fn)(const volatile u32 *cfg, u32 fclk);
 typedef void (*kmp_tx_fn)(u8 b);
 #define KMP_TX_BYTE   ((kmp_tx_fn)(0x5F64u | 1u))
 static const u8 kmp_query[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
+// v116: the same frame, referenced by entry_iec_swap and handed to the vendor's own send routine.
+const u8 kmp_iec_frame[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
+
+// v117: called from entry_iec_swap immediately before the vendor's send.
+//
+// v116 poked the prescaler nibble directly and every captured byte came back 0x7F -- the signature
+// of a UART sampling at the wrong rate. Writing the clock divider while the SAU is running does not
+// reconfigure the channel: the divisor is not reloaded and the channel is not restarted. v103
+// proved the register is WRITABLE; it never proved a bare poke yields a working link.
+//
+// So do it the way v110 established: hand the vendor's own group-B init a 1200-baud record copied
+// from the live one at 0xF4C8. Snapshots are taken here too, since v116 left them unwritten.
+// Returns the frame address so the trampoline only has to set the length.
+const u8 *kmp_iec_setup(void)
+{
+    KMP_CFG[0] = 1200u;          // baud   (live record holds 9600)
+    KMP_CFG[1] = CFG_REC[1];     // framing/flags verbatim (0x00000101)
+    VENDOR_B_INIT(KMP_CFG, *FCLK_ADDR);
+    install_rx_stub();           // the init just reset the callback -- take it back before we send
+    *SNAP_PRE_AFTER_INIT = (u32)(*SAU_B_SMR & 0x000Fu);   // expect 8
+    *SNAP_SDR_AFTER_INIT = (u32)(*SAU_B_SDR1);            // expect 0xCE00
+    *SNAP_CNT_AFTER_TX   = *STUB_COUNT;                   // ring depth just before the send
+    *SNAP_PRE_AFTER_TX   = (u32)(*SAU_B_SMR & 0x000Fu);
+    return kmp_iec_frame;
+}
 
 // Retune group B 9600 -> 1200 (prescaler 5 -> 8, same divisor 103) and clock the query out.
 // No restore: the read session re-applies 9600 from the 0xF4C8 record on the next wake, which
 // v104 proved. The reply, if any, is gathered by the RAM collector and shows up as STUB_COUNT.
-static void kmp_fire(void)
+// Retained for reference: the report-phase fire path, superseded by entry_iec_swap in v116.
+// __attribute__((unused)) so -Werror does not trip now that nothing calls it.
+__attribute__((unused)) static void kmp_fire(void)
 {
     OPTICAL_POWER_ON();          // P72 VCC + RX enable -- without this the head is dark
     KMP_CFG[0] = 1200u;          // baud  (live record holds 9600)
@@ -371,35 +403,37 @@ u32 canary_probe_nodata(void)
 {
     install_rx_stub();
     *PTEST_CALLS = *PTEST_CALLS + 1u;
-    u32 t = (*TURN_ADDR) & 15u;
+    u32 t = (*TURN_ADDR) & 3u;
     *TURN_ADDR = t + 1u;
 
-    // Slot 3 clears the ring and fires, so slots 6..15 show the RESPONSE, not history.
-    if (t == 3 && *STUB_STATE == 1u) {
-        for (u32 i = 0; i < STUB_BUF_LEN; i++) *(volatile u8 *)(STUB_BUF + i) = 0;
-        *STUB_COUNT = 0u;
-        kmp_fire();
-    }
+    // v116: the report phase no longer fires anything. entry_iec_swap makes the VENDOR transmit
+    // our KMP frame inside its own read session, with the head powered. Clearing the ring here
+    // would wipe exactly the traffic we want, so we only observe now.
 
-    // v111: EVERY word is self-describing -- slot id in the top nibble, 28 bits of payload, no
-    // overlapping fields. The previous scheme mixed untagged ring words with tagged status words,
-    // so a zero count and an empty ring word were indistinguishable, and the 0x57AB status word
-    // ORed count<<8 over its own literal (bits 16-19) and reported nonsense.
+    // v115: FOUR slots, not sixteen. At -103 dBm most cmd-37 packets never reach the bridge, so a
+    // 16-slot rotation means the interesting values effectively never arrive. Everything is packed
+    // so each slot is self-contained and any single packet is worth having.
     const volatile u8 *b = (const volatile u8 *)STUB_BUF;
     switch (t) {
-    case 0:  return 0x00000000u | (*SNAP_PRE_AFTER_INIT & 0xFu);    // prescaler AT init (8 = 1200)
-    case 1:  return 0x10000000u | (*STUB_COUNT & 0x0FFFFFFFu);      // bytes captured since fire
-    case 2:  return 0x20000000u | (*STUB_STATE & 0xFu);             // 1 = collector installed
-    case 3:  return 0x30000000u | (*PTEST_CALLS & 0x0FFFFFFFu);     // heartbeat; query just fired
-    case 4:  return 0x40000000u | (KMP_CFG[0] & 0x0FFFFFFFu);       // baud we handed the vendor
-    case 5:  return 0x50000000u | (*SNAP_SDR_AFTER_INIT & 0xFFFFu);  // SDR at init (0xCE00 = div 103)
-    case 6:  return 0x60000000u | (*SNAP_CNT_AFTER_TX & 0x0FFFFFFFu); // bytes the instant TX ended
-    case 7:  return 0x70000000u | (*SNAP_PRE_AFTER_TX & 0xFu);        // prescaler after last TX byte
-    default: break;
+    case 0:  // the whole config story in one word
+        //  [27:24] prescaler at init (8 = 1200 took, 5 = did not)
+        //  [23: 8] SDR at init       (0xCE00 = divisor 103)
+        //  [ 7: 4] prescaler after the last TX byte
+        //  [ 3: 0] collector state
+        return 0x00000000u
+             | ((*SNAP_PRE_AFTER_INIT & 0xFu) << 24)
+             | ((*SNAP_SDR_AFTER_INIT & 0xFFFFu) << 8)
+             | ((*SNAP_PRE_AFTER_TX  & 0xFu) << 4)
+             | ((*SAU_B_CB == (STUB_ADDR | 1u)) ? 1u : 0u);   // slot is OURS right now?
+    case 1:  // the whole result story in one word
+        //  [27:16] bytes present the INSTANT TX ended (self-echo shows up here)
+        //  [15: 0] bytes captured since the query fired
+        return 0x10000000u
+             | ((*SNAP_CNT_AFTER_TX & 0xFFFu) << 16)
+             | (*STUB_COUNT & 0xFFFFu);
+    case 2:  return 0x20000000u | ((u32)b[0] << 16) | ((u32)b[1] << 8) | (u32)b[2];
+    default: return 0x30000000u | ((u32)b[3] << 16) | ((u32)b[4] << 8) | (u32)b[5];
     }
-    // slots 8..15 -> ring bytes, THREE per word so the tag never collides with data
-    u32 k = (t - 8u) * 3u;
-    return ((u32)(t) << 28) | ((u32)b[k] << 16) | ((u32)b[k+1] << 8) | (u32)b[k+2];
 }
 
 void canary_probe_energy(void)

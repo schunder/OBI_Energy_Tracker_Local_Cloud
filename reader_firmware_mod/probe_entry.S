@@ -111,3 +111,34 @@ entry_probe_nodata:
     mov  r5, r0                // replayed (was: r5 = literal 0x7FFFFFFF)
     mov  r0, r5                // replayed
     pop  {r1, pc}
+
+// --- entry_iec_swap ------------------------------------------------------
+// v116. THE VENDOR TRANSMITS FOR US.
+//
+// 0xD138 is an IEC 62056-21 mode-C state machine: it sends "/?!\r\n" and then ACKs with "\x06 000".
+// Our RAM collector captured 2F 3F 21 off the eye glass, so this path runs on the Kamstrup -- the
+// reader is already doing active optical request/response, inside the read session, with the head
+// powered by its own 0x5BFA. The meter just does not speak IEC.
+//
+// The send is LENGTH-COUNTED, not NUL-terminated:
+//     d1a4: movs r1,#5        <- length
+//     d1a6: adr  r0,0xd2cc    <- buffer
+//     d1a8: bl   0x9738       <- send(buf,len)
+// so a frame containing 0x00 is fine, and we only need to supply different r0/r1. We replace the
+// two setup instructions (4 bytes) and hand the vendor OUR frame. The buffer lives in our blob, so
+// the 8-byte slack at 0xD2CC and the lack of a free ADR-reachable slot stop mattering.
+//
+// Also forces group-B to 1200 baud first: prescaler nibble at 0x40041566, 5 -> 8 (divisor 103
+// unchanged => 64e6/2^8/208 = 1201.9 baud). Measured writable in v103, and the next wake restores
+// 9600 from the 0xF4C8 record by itself (v104), so there is nothing to undo.
+//
+// Returns with r0/r1 set exactly as the replaced instructions would have, so the vendor's `bl` at
+// 0xD1A8 proceeds untouched.
+.section .text.entry_iec_swap, "ax", %progbits
+.global entry_iec_swap
+.thumb_func
+entry_iec_swap:
+    push {lr}
+    bl   kmp_iec_setup         // vendor group-B init at 1200 + snapshots; returns r0 = frame
+    movs r1, #9                // replayed length, now 9
+    pop  {pc}                  // -> 0xD1A8: bl 0x9738 sends OUR frame at 1200
