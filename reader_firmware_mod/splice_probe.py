@@ -25,7 +25,7 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 SRC = HERE / "reader_stock_v57.bin"
-DST = HERE / "build" / "reader_probe_v110.bin"
+DST = HERE / "build" / "reader_probe_v114.bin"
 BLOB = HERE / "build" / "probe.bin"
 SYMS = HERE / "build" / "probe.sym"
 BASE = 0x4000
@@ -53,7 +53,7 @@ ENTRY = "entry_probe_nodata"
 
 # softver: 91 canary, 92..98 the armed attempts, 99 = this probe. Must differ from the
 # reader's current version or the gateway treats the OTA as a no-op. 99 = v99 probe, 100 = this.
-SOFTVER = 110
+SOFTVER = 114
 SOFTVER_OFFSETS = (0x8B36, 0x8B80)
 
 
@@ -99,6 +99,15 @@ def main():
     print(f"softver 57 -> {SOFTVER}")
 
     blob = BLOB.read_bytes()
+    end = BASE + len(data) + len(blob)
+    # HARD LIMIT: the OTA writes `size` bytes from 0x4000, so the blob overwrites the config area
+    # that runs from 0xEE08 up to the meter baud record at 0xF4C8. That data is NOT restorable from
+    # a canary. v113 reached 0xF409 and the reader refused to boot it.
+    LIMIT = 0xF200
+    assert end <= LIMIT, (
+        "blob ends at %s, past the safe limit %s -- it would overwrite reader config. "
+        "Shrink it (KEEP only the spliced entry in probe_link.ld)." % (hex(end), hex(LIMIT)))
+    print("blob ends at %s (limit %s, %d bytes of headroom)" % (hex(end), hex(LIMIT), LIMIT - end))
     data += blob
     DST.write_bytes(data)
     print(f"orig {orig_len}  blob {len(blob)}  total {len(data)}")

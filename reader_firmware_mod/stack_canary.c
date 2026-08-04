@@ -312,9 +312,30 @@ u32 canary_probe_report(u32 power_in) { u32 v = probe_core(); return v ? v : pow
 // saved r1). So copy the live record from 0xF4C8, drop the baud word to 1200, and let the vendor
 // do the full bring-up -- clocks, port enable, framing -- exactly as it does each wake.
 // No restore needed: the next read session re-applies 9600 from 0xF4C8 (proved by v104).
+// v112: THE MISSING PIECE. The optical head has a VCC power gate on P72, separate from the UART.
+// The read session powers it on at 0x5C08 (inside 0x5BFA) and OFF at 0x5B58 (inside 0x5B4C), and
+// 0x5B4C is the last call of sub_59E8 -- so by the time our hook runs in the decode phase the head
+// is unpowered. v110 configured the UART correctly and then transmitted into a dead head, which is
+// why not even our own echo came back.
+//
+// Rather than reconstruct sub_7850's argument semantics (r0=7, r2=4, r1=2 on / 0 off), call the
+// vendor's whole power-on routine the way the read session does. Both take no arguments.
+typedef void (*void_fn)(void);
+#define OPTICAL_POWER_ON  ((void_fn)(0x5BFAu | 1u))   // GPIO VCC enable + RX enable
+#define OPTICAL_POWER_OFF ((void_fn)(0x5B4Cu | 1u))   // the session's own teardown
+
 typedef void (*uart_init_fn)(const volatile u32 *cfg, u32 fclk);
 #define VENDOR_B_INIT ((uart_init_fn)(0xDBA0u | 1u))
 #define KMP_CFG       ((volatile u32 *)0x200010A0u)   // our 8-byte config record, below PAINT_LO
+
+// v113: snapshots taken INSIDE kmp_fire(), because the rotation reports slot 0 about five minutes
+// and several wakes after the query fires -- by which time the read session has re-applied 9600
+// from 0xF4C8 (v104). Sampling the prescaler there always reads 5 and looks like a failed retune
+// even when the retune worked. These capture the truth at the instant it matters.
+#define SNAP_PRE_AFTER_INIT ((volatile u32 *)0x200010A8u)  // prescaler right after the vendor init
+#define SNAP_SDR_AFTER_INIT ((volatile u32 *)0x200010ACu)  // SDR divisor right after the init
+#define SNAP_CNT_AFTER_TX   ((volatile u32 *)0x200010B0u)  // bytes seen the instant TX finished
+#define SNAP_PRE_AFTER_TX   ((volatile u32 *)0x200010B4u)  // prescaler right after the last TX byte
 
 typedef void (*kmp_tx_fn)(u8 b);
 #define KMP_TX_BYTE   ((kmp_tx_fn)(0x5F64u | 1u))
@@ -325,10 +346,25 @@ static const u8 kmp_query[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
 // v104 proved. The reply, if any, is gathered by the RAM collector and shows up as STUB_COUNT.
 static void kmp_fire(void)
 {
+    OPTICAL_POWER_ON();          // P72 VCC + RX enable -- without this the head is dark
     KMP_CFG[0] = 1200u;          // baud  (live record holds 9600)
     KMP_CFG[1] = CFG_REC[1];     // keep the vendor's framing/flags word verbatim (0x00000101)
     VENDOR_B_INIT(KMP_CFG, *FCLK_ADDR);
+
+    // snapshot the moment the init returns -- prescaler 8 + SDR 0xCE00 means 1200 baud took
+    *SNAP_PRE_AFTER_INIT = (u32)(*SAU_B_SMR & 0x000Fu);
+    *SNAP_SDR_AFTER_INIT = (u32)(*SAU_B_SDR1);
+
     for (u32 i = 0; i < sizeof kmp_query; i++) KMP_TX_BYTE(kmp_query[i]);
+
+    // and the moment the last byte is clocked out: a non-zero count here means bytes came back
+    // immediately, i.e. our own echo off the eye glass rather than something minutes later
+    *SNAP_CNT_AFTER_TX = *STUB_COUNT;
+    *SNAP_PRE_AFTER_TX = (u32)(*SAU_B_SMR & 0x000Fu);
+    // Head deliberately LEFT POWERED: the reply arrives asynchronously through our RAM collector
+    // over the next few hundred ms. The next wake's read session powers it down again at 0x5B4C.
+    // (~1 s of blocking here would also be safe -- the radio is not up yet and the WDT is 2-4 s --
+    //  but async collection costs nothing and avoids holding the CPU.)
 }
 
 u32 canary_probe_nodata(void)
@@ -338,25 +374,32 @@ u32 canary_probe_nodata(void)
     u32 t = (*TURN_ADDR) & 15u;
     *TURN_ADDR = t + 1u;
 
-    // Slot 3 fires the query and CLEARS the ring, so slots 4..15 dump exactly what came back in
-    // response rather than whatever was already sitting there.
+    // Slot 3 clears the ring and fires, so slots 6..15 show the RESPONSE, not history.
     if (t == 3 && *STUB_STATE == 1u) {
         for (u32 i = 0; i < STUB_BUF_LEN; i++) *(volatile u8 *)(STUB_BUF + i) = 0;
         *STUB_COUNT = 0u;
         kmp_fire();
     }
 
-    if (t == 0) return 0xC0FFEE00u | (u32)(*SAU_B_SMR & 0x000Fu);   // marker + live prescaler
-    if (t == 1) return *STUB_COUNT;                                  // how many bytes came back
-    if (t == 2) return 0x57AB0000u | (*STUB_STATE & 0xFu) | ((*STUB_COUNT & 0xFFFu) << 8);
-    if (t == 3) return 0xBEA70000u | (*PTEST_CALLS & 0xFFFFu);       // heartbeat; query just fired
-    if (t == 4) return KMP_CFG[0];                                   // baud we asked the vendor for
-    if (t == 5) return 0xC0FFEE00u | (u32)(*SAU_B_SMR & 0x000Fu);    // prescaler AFTER the init
-
-    // slots 6..15 -> ring bytes 0..39, packed big-endian so the hex reads left-to-right
-    u32 k = (t - 6u) * 4u;
+    // v111: EVERY word is self-describing -- slot id in the top nibble, 28 bits of payload, no
+    // overlapping fields. The previous scheme mixed untagged ring words with tagged status words,
+    // so a zero count and an empty ring word were indistinguishable, and the 0x57AB status word
+    // ORed count<<8 over its own literal (bits 16-19) and reported nonsense.
     const volatile u8 *b = (const volatile u8 *)STUB_BUF;
-    return ((u32)b[k] << 24) | ((u32)b[k+1] << 16) | ((u32)b[k+2] << 8) | (u32)b[k+3];
+    switch (t) {
+    case 0:  return 0x00000000u | (*SNAP_PRE_AFTER_INIT & 0xFu);    // prescaler AT init (8 = 1200)
+    case 1:  return 0x10000000u | (*STUB_COUNT & 0x0FFFFFFFu);      // bytes captured since fire
+    case 2:  return 0x20000000u | (*STUB_STATE & 0xFu);             // 1 = collector installed
+    case 3:  return 0x30000000u | (*PTEST_CALLS & 0x0FFFFFFFu);     // heartbeat; query just fired
+    case 4:  return 0x40000000u | (KMP_CFG[0] & 0x0FFFFFFFu);       // baud we handed the vendor
+    case 5:  return 0x50000000u | (*SNAP_SDR_AFTER_INIT & 0xFFFFu);  // SDR at init (0xCE00 = div 103)
+    case 6:  return 0x60000000u | (*SNAP_CNT_AFTER_TX & 0x0FFFFFFFu); // bytes the instant TX ended
+    case 7:  return 0x70000000u | (*SNAP_PRE_AFTER_TX & 0xFu);        // prescaler after last TX byte
+    default: break;
+    }
+    // slots 8..15 -> ring bytes, THREE per word so the tag never collides with data
+    u32 k = (t - 8u) * 3u;
+    return ((u32)(t) << 28) | ((u32)b[k] << 16) | ((u32)b[k+1] << 8) | (u32)b[k+2];
 }
 
 void canary_probe_energy(void)
