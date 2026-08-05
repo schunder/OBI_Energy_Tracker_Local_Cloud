@@ -143,7 +143,14 @@ static void install_rx_stub(void)
     if (*STUB_STATE == 2u && *SAU_B_CB == 0u) return;  // vendor has no collector; blx 0 would fault
 
     u32 orig = *SAU_B_CB;
-    if (orig == 0u) { *STUB_STATE = 2u; return; }
+    // v119: VALIDATE before chaining. v118 installed while chaining to whatever the slot happened
+    // to hold, so a transient or half-written value during the vendor's init would have our ISR do
+    // `blx <garbage>` on the next received byte. A real vendor callback is a Thumb code pointer in
+    // the app image: odd (thumb bit) and inside 0x4000..0xEE08. Anything else -> refuse.
+    if (orig == 0u
+        || (orig & 1u) == 0u
+        || (orig & ~1u) <  0x4000u
+        || (orig & ~1u) >= 0xEE08u) { *STUB_STATE = 2u; return; }
 
     volatile u16 *c = (volatile u16 *)STUB_ADDR;
     c[0]  = 0xB510u; // push {r4, lr}
@@ -341,6 +348,18 @@ typedef void (*uart_init_fn)(const volatile u32 *cfg, u32 fclk);
 #define SNAP_SDR_AFTER_INIT ((volatile u32 *)0x200010ACu)  // SDR divisor right after the init
 #define SNAP_CNT_AFTER_TX   ((volatile u32 *)0x200010B0u)  // bytes seen the instant TX finished
 #define SNAP_PRE_AFTER_TX   ((volatile u32 *)0x200010B4u)  // prescaler right after the last TX byte
+// v120: how many times the vendor's IEC state machine has actually reached the request send. We
+// have observed that `/?!` exactly ONCE. If this stays 0 or crawls, a quiet ring says nothing about
+// the meter -- our frame simply is not going out. This is the number that makes silence meaningful.
+#define IEC_FIRES           ((volatile u32 *)0x200010B8u)
+// v121: the IEC state machine's own state word (u16), from literal @0xD2C8.
+//   0     -> sets 0xE5 and falls through
+//   0xE5  -> ... -> 0xD1A4 SEND ... -> sets 0xF3
+//   0xF3  -> "await response"
+// A Kamstrup never answers IEC, so once it reaches 0xF3 it parks there and the send never repeats.
+// That matches the evidence exactly: we captured "/?!" ONCE under v115 and never again.
+#define IEC_STATE           ((volatile u16 *)0x20000184u)
+#define IEC_KICKS           ((volatile u32 *)0x200010BCu)
 
 typedef void (*kmp_tx_fn)(u8 b);
 #define KMP_TX_BYTE   ((kmp_tx_fn)(0x5F64u | 1u))
@@ -360,6 +379,7 @@ const u8 kmp_iec_frame[9] = { 0x80,0x3F,0x10,0x01,0x00,0x44,0x4D,0xC0,0x0D };
 // Returns the frame address so the trampoline only has to set the length.
 const u8 *kmp_iec_setup(void)
 {
+    *IEC_FIRES = *IEC_FIRES + 1u;      // count every time the vendor asks us for the request frame
     KMP_CFG[0] = 1200u;          // baud   (live record holds 9600)
     KMP_CFG[1] = CFG_REC[1];     // framing/flags verbatim (0x00000101)
     VENDOR_B_INIT(KMP_CFG, *FCLK_ADDR);
@@ -413,6 +433,11 @@ u32 canary_probe_nodata(void)
     // v115: FOUR slots, not sixteen. At -103 dBm most cmd-37 packets never reach the bridge, so a
     // 16-slot rotation means the interesting values effectively never arrive. Everything is packed
     // so each slot is self-contained and any single packet is worth having.
+    // v121: if the machine is parked awaiting a reply that cannot come, put it back to idle so the
+    // next read session restarts the handshake and re-sends. This converts a one-shot into a poll.
+    // Done from the REPORT phase, so we are not racing the read session that owns the port.
+    if (*IEC_STATE == 0x00F3u) { *IEC_STATE = 0u; *IEC_KICKS = *IEC_KICKS + 1u; }
+
     const volatile u8 *b = (const volatile u8 *)STUB_BUF;
     switch (t) {
     case 0:  // the whole config story in one word
@@ -420,16 +445,19 @@ u32 canary_probe_nodata(void)
         //  [23: 8] SDR at init       (0xCE00 = divisor 103)
         //  [ 7: 4] prescaler after the last TX byte
         //  [ 3: 0] collector state
+        //  [27:16] IEC state word   [15:12] prescaler@init   [11:8] prescaler@TXend
+        //  [ 7: 4] kicks issued      [ 3: 0] collector slot is ours
         return 0x00000000u
-             | ((*SNAP_PRE_AFTER_INIT & 0xFu) << 24)
-             | ((*SNAP_SDR_AFTER_INIT & 0xFFFFu) << 8)
-             | ((*SNAP_PRE_AFTER_TX  & 0xFu) << 4)
-             | ((*SAU_B_CB == (STUB_ADDR | 1u)) ? 1u : 0u);   // slot is OURS right now?
+             | ((u32)(*IEC_STATE & 0xFFFu) << 16)
+             | ((*SNAP_PRE_AFTER_INIT & 0xFu) << 12)
+             | ((*SNAP_PRE_AFTER_TX  & 0xFu) << 8)
+             | ((*IEC_KICKS & 0xFu) << 4)
+             | ((*SAU_B_CB == (STUB_ADDR | 1u)) ? 1u : 0u);
     case 1:  // the whole result story in one word
-        //  [27:16] bytes present the INSTANT TX ended (self-echo shows up here)
-        //  [15: 0] bytes captured since the query fired
+        //  [27:16] how many times the IEC send has fired  <- makes silence interpretable
+        //  [15: 0] bytes captured by the collector
         return 0x10000000u
-             | ((*SNAP_CNT_AFTER_TX & 0xFFFu) << 16)
+             | ((*IEC_FIRES & 0xFFFu) << 16)
              | (*STUB_COUNT & 0xFFFFu);
     case 2:  return 0x20000000u | ((u32)b[0] << 16) | ((u32)b[1] << 8) | (u32)b[2];
     default: return 0x30000000u | ((u32)b[3] << 16) | ((u32)b[4] << 8) | (u32)b[5];
