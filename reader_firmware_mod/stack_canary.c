@@ -360,6 +360,19 @@ typedef void (*uart_init_fn)(const volatile u32 *cfg, u32 fclk);
 // That matches the evidence exactly: we captured "/?!" ONCE under v115 and never again.
 #define IEC_STATE           ((volatile u16 *)0x20000184u)
 #define IEC_KICKS           ((volatile u32 *)0x200010BCu)
+// v122: the two gates between state 0xE5 and the send at 0xD1A4.
+//   d17c: bl 0x7a30 ; cmp r0,#0 ; beq out      <- gate A: helper must return non-zero
+//   d184: ldrb r0,[r7,#1] ; cmp r0,#2 ; beq go <- gate B: byte at 0x20000179 must be 2
+// r7 = r5-12 and r5 = 0x20000184 (the state word), so r7 = 0x20000178.
+// The machine parks at 0xE5 because one of these fails every cycle -- NOT at 0xF3 as I assumed.
+#define IEC_CTL             ((volatile u8 *)0x20000178u)   // [0]=flag set to 1 before sending
+#define IEC_MODE            ((volatile u8 *)0x20000179u)   // [1]=the ==2 gate
+// v123: gate A decoded. sub_7A30 is just:
+//     ldr r0,=0x20000110 ; ldrb r0,[r0] ; cmp r0,#3 ; bcc ->0 ; ->1
+// i.e. the IEC fallback only engages once an attempt counter reaches 3 ("after N failed reads,
+// try IEC"). Forcing it to 3 tells the firmware it has tried enough, which is exactly the state we
+// want it in permanently on a meter that will never answer SML.
+#define IEC_ATTEMPTS        ((volatile u8 *)0x20000110u)
 
 typedef void (*kmp_tx_fn)(u8 b);
 #define KMP_TX_BYTE   ((kmp_tx_fn)(0x5F64u | 1u))
@@ -437,6 +450,10 @@ u32 canary_probe_nodata(void)
     // next read session restarts the handshake and re-sends. This converts a one-shot into a poll.
     // Done from the REPORT phase, so we are not racing the read session that owns the port.
     if (*IEC_STATE == 0x00F3u) { *IEC_STATE = 0u; *IEC_KICKS = *IEC_KICKS + 1u; }
+    // v122: force gate B. If the mode byte is not 2 the send is skipped every cycle, which is
+    // exactly what "state 0xE5, fires 0" looks like. Setting it costs nothing if it was already 2.
+    if (*IEC_MODE != 2u) { *IEC_MODE = 2u; *IEC_KICKS = *IEC_KICKS + 1u; }
+    if (*IEC_ATTEMPTS < 3u) { *IEC_ATTEMPTS = 3u; *IEC_KICKS = *IEC_KICKS + 1u; }
 
     const volatile u8 *b = (const volatile u8 *)STUB_BUF;
     switch (t) {
@@ -447,10 +464,11 @@ u32 canary_probe_nodata(void)
         //  [ 3: 0] collector state
         //  [27:16] IEC state word   [15:12] prescaler@init   [11:8] prescaler@TXend
         //  [ 7: 4] kicks issued      [ 3: 0] collector slot is ours
+        //  v122: [27:16] state  [15:12] IEC_CTL[0]  [11:8] IEC_MODE (gate B)  [7:4] kicks  [3:0] ours
         return 0x00000000u
              | ((u32)(*IEC_STATE & 0xFFFu) << 16)
-             | ((*SNAP_PRE_AFTER_INIT & 0xFu) << 12)
-             | ((*SNAP_PRE_AFTER_TX  & 0xFu) << 8)
+             | ((u32)(*IEC_ATTEMPTS & 0xFu) << 12)   // gate A counter (>=3 opens)
+             | ((u32)(*IEC_MODE & 0xFu) << 8)
              | ((*IEC_KICKS & 0xFu) << 4)
              | ((*SAU_B_CB == (STUB_ADDR | 1u)) ? 1u : 0u);
     case 1:  // the whole result story in one word
