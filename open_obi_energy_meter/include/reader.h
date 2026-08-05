@@ -12,6 +12,8 @@ struct Reader {
   bool     isOld    = false;
   bool     decoded  = false;
   uint8_t  decFails = 0;
+  uint8_t  ecdhRepeats = 0;     // cmd-32 retries seen while we already believed we were keyed --
+                                // means our 68-byte reply never landed; see sendEcdhReply()
   uint32_t lastBind = 0;
   float    lastRssi = -70;
   float    lastSnr  = 0;         // SX1262 packet SNR (dB) of the last frame from this reader

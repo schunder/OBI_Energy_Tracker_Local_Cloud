@@ -32,6 +32,30 @@ bool obi_ecdh_generate(uint8_t out_pub64[64]) {
   return true;
 }
 
+// The gateway's keypair MUST survive a reboot. It used to be regenerated in setup(), which meant
+// every restart gave the bridge a new cryptographic identity: readers keep the TEA key derived
+// from the OLD pubkey, we derive a different shared secret from the new one, and the pairing can
+// never converge again. Observed live -- a reader sat in a cmd-32 retry loop for over an hour, and
+// no amount of re-pairing or retransmission helped, because the reply was arriving and was simply
+// derived from the wrong key.
+bool obi_ecdh_load(const uint8_t priv32[32], uint8_t out_pub64[64]) {
+  ensure_init();
+  if (mbedtls_mpi_read_binary(&s_d, priv32, 32) != 0) return false;
+  if (mbedtls_ecp_check_privkey(&s_grp, &s_d) != 0) return false;          // reject a bad scalar
+  if (mbedtls_ecp_mul(&s_grp, &s_Q, &s_d, &s_grp.G, obi_rng, nullptr) != 0) return false;
+  uint8_t buf[65]; size_t olen = 0;
+  if (mbedtls_ecp_point_write_binary(&s_grp, &s_Q, MBEDTLS_ECP_PF_UNCOMPRESSED,
+                                     &olen, buf, sizeof(buf)) != 0) return false;
+  if (olen != 65 || buf[0] != 0x04) return false;
+  memcpy(out_pub64, buf + 1, 64);
+  return true;
+}
+
+bool obi_ecdh_export(uint8_t out_priv32[32]) {
+  ensure_init();
+  return mbedtls_mpi_write_binary(&s_d, out_priv32, 32) == 0;
+}
+
 bool obi_ecdh_compute(const uint8_t peer_pub64[64], uint8_t out_secret32[32]) {
   ensure_init();
   mbedtls_ecp_point Qp; mbedtls_ecp_point_init(&Qp);

@@ -590,10 +590,24 @@ static void sendReconnectAck(Reader *r, float rssi) {
   r->lastBind = millis();
 }
 
+// The 68-byte ECDH reply is the largest frame in the whole handshake, so on a marginal link it is
+// the one most likely to be lost -- and losing it LIVELOCKS the pairing: the reader retries, every
+// retry makes us derive a FRESH key (see the cmd-32 handler), and the two sides never converge. The
+// usual self-heal (3 decrypt failures -> drop the key and re-bind) cannot fire, because a reader
+// stuck before key_ready never sends encrypted data to fail on.
+//
+// Observed live at -90 dBm: an hour of cmd-32 retries with no convergence.
+//
+// Two fixes, both here:
+//   1. send the reply more than once -- three copies turn a 50% per-frame loss into ~12%
+//   2. do NOT commit haveKey until the reader proves it (see OBI_ECDH_CONFIRM below)
 static void sendEcdhReply(Reader *r) {
   uint8_t f[80];
   size_t n = obi_build_frame(f, r->handle, OBI_CMD_ECDH, g_ourPub, 64);
-  txFrame(f, n, "ecdh");
+  for (int i = 0; i < 3; i++) {          // retransmit: cheap, and the reader ignores duplicates
+    txFrame(f, n, "ecdh");
+    if (i < 2) delay(12);                // small gap so the reader's RX can turn around
+  }
 }
 
 // addressed scan ack — a fresh 1.2.x reader announces (cmd 35) then waits ~300 ms for cmd 36
@@ -772,11 +786,22 @@ static void handleRx() {
       if (!acceptReader(r)) { Serial.println("  ecdh from unassigned reader — ignoring"); break; }
       if (len - 4 < 64) { Serial.println("  ecdh: short pubkey"); break; }
       uint8_t secret[32];
+      // If we already believed we were keyed and the reader is STILL asking, our previous reply
+      // never landed. Count it: after a few, fall back to the full pair-ack sequence rather than
+      // silently deriving yet another key the reader will never see.
+      if (r->haveKey) {
+        if (++r->ecdhRepeats >= 3) { r->haveKey = false; r->ecdhRepeats = 0; sendPairAcks(r, rssi); }
+      } else r->ecdhRepeats = 0;
       if (obi_ecdh_compute(d + 4, secret)) {
         memcpy(r->key, secret, 16);                         // TEA key = first 16 of shared X
         r->haveKey = true;
         Serial.print("  ECDH ok, TEA key = "); hexdump(r->key, 16); Serial.println();
         sendEcdhReply(r);                                   // send our pubkey back
+        // Follow the key exchange with the activation acks. sendPairAcks() is otherwise only
+        // reached on the !haveKey path, so a reader that re-keys after a gateway restart gets its
+        // pubkey answered and then nothing -- it never advances to sending energy, and loops back
+        // to reconnect(58). Observed live: 58 -> bind -> 32 -> ecdh -> 59 -> 58 -> ... forever.
+        sendPairAcks(r, rssi);
       } else {
         Serial.println("  ECDH compute failed");
       }
@@ -1048,7 +1073,20 @@ void setup() {
   g_loraSem = xSemaphoreCreateBinary();
   radio.setDio1Action(onDio1);
 
-  g_ecdhReady = obi_ecdh_generate(g_ourPub);
+  // Persist the keypair: a fresh identity on every boot permanently breaks every existing pairing.
+  {
+    Preferences kp; uint8_t priv[32];
+    bool have = false;
+    if (kp.begin("obiecdh", true)) { have = kp.getBytes("priv", priv, 32) == 32; kp.end(); }
+    g_ecdhReady = have && obi_ecdh_load(priv, g_ourPub);
+    if (!g_ecdhReady) {                                   // first boot, or a stored key we cannot use
+      g_ecdhReady = obi_ecdh_generate(g_ourPub);
+      if (g_ecdhReady && obi_ecdh_export(priv) && kp.begin("obiecdh", false)) {
+        kp.putBytes("priv", priv, 32); kp.end();
+        Serial.println("[ecdh] generated and persisted a new gateway keypair");
+      }
+    } else Serial.println("[ecdh] restored the persisted gateway keypair");
+  }
   Serial.printf("ECDH keypair: %s\n", g_ecdhReady ? "ready" : "FAILED");
   Serial.printf("bind crc16(gwid)=0x%04X\n", obi_crc16(GWID, 6));
 
